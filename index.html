@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+<meta name="theme-color" content="#0A0F1E"/>
+<title>World Cup 2026 Sweepstake</title>
+<style>html,body{margin:0;padding:0;background:#0A0F1E}#root{min-height:100vh}</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js" crossorigin></script>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- localStorage-backed shim so the app's storage calls work on a normal static page -->
+<script>
+if(!window.storage){
+  window.storage = {
+    async get(k){ try{ const v=localStorage.getItem(k); return v==null?null:{key:k,value:v}; }catch(e){ return null; } },
+    async set(k,v){ try{ localStorage.setItem(k,v); }catch(e){} return {key:k,value:v}; },
+    async delete(k){ try{ localStorage.removeItem(k); }catch(e){} return {key:k,deleted:true}; },
+    async list(p){ let keys=[]; try{ keys=Object.keys(localStorage).filter(x=>!p||x.startsWith(p)); }catch(e){} return {keys}; }
+  };
+}
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef, useCallback } = React;
+
+
+/* ============================================================
+   WORLD CUP 2026 — FAMILY SWEEPSTAKE TRACKER  (v3)
+   • Live sync via Anthropic web search (batched per group),
+     with a web-search fallback
+   • Trophy odds from real bookmaker prices, re-normalised live
+   • True player-vs-player head-to-head
+   • Golden Boot (scorers) + Golden Glove (clean sheets, derived)
+   • Shared storage => one URL for the whole family
+   ============================================================ */
+
+const OWNERS = ["Mum","Harry","Vicki","Casey","Dan","Nan","Ruby","Dad","George","Harriette"];
+const OWNER_COLOR = {
+  Mum:"#F4C95D", Harry:"#5B8CFF", Vicki:"#3FD78B", Casey:"#FB6B5B", Dan:"#C792EA",
+  Nan:"#FF9E64", Ruby:"#FF5C8A", Dad:"#4FD0E0", George:"#A3E635", Harriette:"#E8B04B",
+};
+const OWNER_OF = {
+  "Japan":"Mum","Qatar":"Mum","Argentina":"Mum","United States":"Mum","Sweden":"Mum",
+  "Senegal":"Harry","Egypt":"Harry","France":"Harry","Colombia":"Harry",
+  "Ecuador":"Vicki","Switzerland":"Vicki","Saudi Arabia":"Vicki","Australia":"Vicki","Ghana":"Vicki",
+  "Mexico":"Casey","Paraguay":"Casey","Ivory Coast":"Casey","Croatia":"Casey","New Zealand":"Casey",
+  "Uzbekistan":"Dan","Turkey":"Dan","Panama":"Dan","Austria":"Dan","Uruguay":"Dan",
+  "Haiti":"Nan","Norway":"Nan","Morocco":"Nan","Spain":"Nan","Belgium":"Nan",
+  "DR Congo":"Ruby","Tunisia":"Ruby","Iraq":"Ruby","Algeria":"Ruby","Scotland":"Ruby",
+  "Canada":"Dad","Portugal":"Dad","Czechia":"Dad","South Korea":"Dad","Jordan":"Dad",
+  "Curaçao":"George","Bosnia & Herzegovina":"George","Brazil":"George","Cape Verde":"George","Germany":"George",
+  "Iran":"Harriette","Netherlands":"Harriette","England":"Harriette","South Africa":"Harriette",
+};
+const GROUPS = {
+  A:["Mexico","South Korea","South Africa","Czechia"],
+  B:["Canada","Switzerland","Qatar","Bosnia & Herzegovina"],
+  C:["Brazil","Morocco","Scotland","Haiti"],
+  D:["United States","Australia","Paraguay","Turkey"],
+  E:["Germany","Ecuador","Ivory Coast","Curaçao"],
+  F:["Netherlands","Japan","Tunisia","Sweden"],
+  G:["Belgium","Iran","Egypt","New Zealand"],
+  H:["Spain","Uruguay","Saudi Arabia","Cape Verde"],
+  I:["France","Senegal","Norway","Iraq"],
+  J:["Argentina","Austria","Algeria","Jordan"],
+  K:["Portugal","Colombia","Uzbekistan","DR Congo"],
+  L:["England","Croatia","Panama","Ghana"],
+};
+const GROUP_LETTERS = Object.keys(GROUPS);
+const GROUP_OF = {}; GROUP_LETTERS.forEach(L=>GROUPS[L].forEach(t=>GROUP_OF[t]=L));
+const ALL_TEAMS = Object.keys(OWNER_OF).sort();
+
+// Real bookmaker decimal odds (mid-June 2026) -> strength.
+const BASE_ODDS = {
+  "Spain":6,"France":6,"England":7,"Argentina":9,"Portugal":10,"Brazil":13,"Germany":15,
+  "Netherlands":21,"Norway":26,"Belgium":34,"Croatia":41,"Uruguay":41,"Morocco":41,"United States":41,
+  "Colombia":51,"Mexico":51,"Senegal":51,"Switzerland":67,"Japan":67,"Sweden":67,
+  "Ecuador":81,"Austria":81,"Turkey":81,"Canada":81,"Ivory Coast":101,"Egypt":126,
+  "South Korea":151,"Australia":151,"Czechia":151,"Scotland":201,"Algeria":201,"Ghana":201,
+  "Qatar":251,"Tunisia":251,"Iran":251,"Paraguay":251,"Bosnia & Herzegovina":251,"DR Congo":251,
+  "Saudi Arabia":501,"Uzbekistan":501,"South Africa":501,"Jordan":751,"Iraq":751,"Panama":751,
+  "Cape Verde":751,"New Zealand":1001,"Haiti":1001,"Curaçao":1001,
+};
+const strength = t => 1/(BASE_ODDS[t] ?? 1500);
+
+const KO_ORDER = ["Round of 32","Round of 16","Quarter-final","Semi-final","Third place","Final"];
+const KO_CODE = { r32:"Round of 32", r16:"Round of 16", qf:"Quarter-final", sf:"Semi-final", "3p":"Third place", final:"Final" };
+
+// name normaliser (handles ESPN + bookmaker variants)
+const ALIAS = {
+  "türkiye":"Turkey","turkiye":"Turkey","turkey":"Turkey","czech republic":"Czechia","czechia":"Czechia",
+  "korea republic":"South Korea","south korea":"South Korea","republic of korea":"South Korea","korea, republic of":"South Korea",
+  "usa":"United States","united states":"United States","united states of america":"United States",
+  "côte d'ivoire":"Ivory Coast","cote d'ivoire":"Ivory Coast","ivory coast":"Ivory Coast",
+  "curacao":"Curaçao","curaçao":"Curaçao","cabo verde":"Cape Verde","cape verde":"Cape Verde",
+  "dr congo":"DR Congo","congo dr":"DR Congo","democratic republic of the congo":"DR Congo","congo democratic republic":"DR Congo",
+  "bosnia":"Bosnia & Herzegovina","bosnia and herzegovina":"Bosnia & Herzegovina","bosnia & herzegovina":"Bosnia & Herzegovina","bosnia-herzegovina":"Bosnia & Herzegovina",
+  "ir iran":"Iran","iran":"Iran","saudi arabia":"Saudi Arabia",
+};
+function normTeam(n){ if(!n) return null; const k=String(n).trim().toLowerCase();
+  if(ALIAS[k]) return ALIAS[k]; const hit=ALL_TEAMS.find(t=>t.toLowerCase()===k); return hit||n; }
+
+/* group fixtures */
+function groupFixtures(L){ const t=GROUPS[L]; const pr=[[0,1],[2,3],[0,2],[1,3],[0,3],[1,2]]; const md=[1,1,2,2,3,3];
+  return pr.map((p,k)=>({id:`${L}-${p[0]}${p[1]}`,md:md[k],a:t[p[0]],b:t[p[1]]})); }
+const FIXTURES={}; GROUP_LETTERS.forEach(L=>FIXTURES[L]=groupFixtures(L));
+const FIXTURE_INDEX={}; GROUP_LETTERS.forEach(L=>FIXTURES[L].forEach(fx=>FIXTURE_INDEX[[fx.a,fx.b].sort().join("|")]={L,fx}));
+
+function computeStandings(L,results){
+  const teams=GROUPS[L]; const idx=Object.fromEntries(teams.map((t,k)=>[t,k]));
+  const st=teams.map(name=>({name,p:0,w:0,d:0,l:0,gf:0,ga:0}));
+  FIXTURES[L].forEach(fx=>{const r=results[fx.id]; if(!r||r.hs==null||r.as==null)return;
+    const A=st[idx[fx.a]],B=st[idx[fx.b]]; A.p++;B.p++;A.gf+=r.hs;A.ga+=r.as;B.gf+=r.as;B.ga+=r.hs;
+    if(r.hs>r.as){A.w++;B.l++;}else if(r.hs<r.as){B.w++;A.l++;}else{A.d++;B.d++;}});
+  st.forEach(x=>{x.pts=x.w*3+x.d;x.gd=x.gf-x.ga;});
+  st.sort((a,b)=>b.pts-a.pts||b.gd-a.gd||b.gf-a.gf||strength(b.name)-strength(a.name)||a.name.localeCompare(b.name));
+  st.forEach((x,k)=>x.rank=k+1); return st;
+}
+const groupDone=(L,r)=>FIXTURES[L].every(fx=>r[fx.id]&&r[fx.id].hs!=null);
+function koWL(m){ if(m.hs==null||m.as==null)return null; if(m.hs>m.as)return{w:m.a,l:m.b}; if(m.hs<m.as)return{w:m.b,l:m.a};
+  if(m.pa!=null&&m.pb!=null&&m.pa!==m.pb)return m.pa>m.pb?{w:m.a,l:m.b}:{w:m.b,l:m.a}; return null; }
+
+/* storage */
+const STATE_KEY="wc26x:state:v1", CONFIG_KEY="wc26x:config:v1";
+const SEED_RESULTS={ "A-02":{hs:2,as:0,src:"auto"},"A-13":{hs:2,as:1,src:"auto"},
+  "B-03":{hs:1,as:1,src:"auto"},"B-12":{hs:1,as:1,src:"auto"},"E-03":{hs:7,as:1,src:"auto"},"F-01":{hs:2,as:2,src:"auto"} };
+const DEFAULT_STATE={ groupResults:SEED_RESULTS, ko:[], awards:{champion:null},
+  scorers:[], keepers:[], autoScorers:[], odds:{}, lastSync:null, syncError:null };
+const hasStore = typeof window!=="undefined" && window.storage;
+
+/* ============================================================ */
+function App(){
+  const [state,setState]=useState(DEFAULT_STATE);
+  const [config,setConfig]=useState({passcode:null});
+  const [loaded,setLoaded]=useState(false);
+  const [tab,setTab]=useState("leaderboard");
+  const [editMode,setEditMode]=useState(false);
+  const [askPin,setAskPin]=useState(false);
+  const [syncing,setSyncing]=useState(false);
+  const saveTimer=useRef(null), stateRef=useRef(state);
+  stateRef.current=state;
+
+  useEffect(()=>{(async()=>{
+    if(hasStore){
+      try{const r=await window.storage.get(STATE_KEY,true); if(r?.value) setState({...DEFAULT_STATE,...JSON.parse(r.value)});}catch(e){}
+      try{const c=await window.storage.get(CONFIG_KEY,true); if(c?.value) setConfig({passcode:null,...JSON.parse(c.value)});}catch(e){}
+    }
+    setLoaded(true);
+  })();},[]);
+
+  const persist=useCallback((next)=>{ setState(next); if(!hasStore)return;
+    if(saveTimer.current)clearTimeout(saveTimer.current);
+    saveTimer.current=setTimeout(()=>window.storage.set(STATE_KEY,JSON.stringify(next),true).catch(()=>{}),400); },[]);
+  const persistNow=useCallback(async(next)=>{ setState(next); if(hasStore){try{await window.storage.set(STATE_KEY,JSON.stringify(next),true);}catch(e){}} },[]);
+  async function persistConfig(next){ setConfig(next); if(hasStore){try{await window.storage.set(CONFIG_KEY,JSON.stringify(next),true);}catch(e){}} }
+
+  const doSync=useCallback(async()=>{
+    setSyncing(true);
+    try{
+      const payload=await fetchLive();
+      let base=stateRef.current;
+      if(hasStore){try{const r=await window.storage.get(STATE_KEY,true); if(r?.value) base={...DEFAULT_STATE,...JSON.parse(r.value)};}catch(e){}}
+      await persistNow(mergeLive(base,payload));
+    }catch(e){ setState({...stateRef.current,syncError:String(e.message||e)}); }
+    finally{ setSyncing(false); }
+  },[persistNow]);
+
+  // One fresh pull when the page opens; after that, only the "Sync now" button refreshes.
+  const didSync=useRef(false);
+  useEffect(()=>{ if(!loaded||didSync.current) return; didSync.current=true; doSync(); },[loaded,doSync]);
+
+  function tryEdit(){ if(!config.passcode) setEditMode(true); else setAskPin(true); }
+  const A=useMemo(()=>analyse(state),[state]);
+  if(!loaded) return <Shell><Style/><div style={{padding:"90px 20px",textAlign:"center",color:C.muted}}>Loading the sweepstake…</div></Shell>;
+
+  const standing=OWNERS.filter(o=>!A.owner[o].out).length;
+  const teamsLeft=ALL_TEAMS.filter(t=>!A.teamOut[t]).length;
+  const leader=A.ownerRanked[0];
+  const TABS=[["leaderboard","Leaderboard"],["h2h","Head-to-head"],["groups","Groups"],["knockouts","Knockouts"],["awards","Awards & stats"]];
+  if(editMode) TABS.push(["enter","Enter results"]);
+
+  return (
+    <Shell>
+      <Style/>
+      <div style={{padding:"22px 18px 6px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12}}>
+          <div>
+            <div style={{font:"800 11px/1 Inter",letterSpacing:"3px",color:C.gold,textTransform:"uppercase",marginBottom:8}}>Canada · México · USA 2026</div>
+            <h1 className="display" style={{margin:0,fontSize:34,lineHeight:.95,letterSpacing:"-.5px",color:C.text}}>The World Cup<br/>Sweepstake</h1>
+          </div>
+          <button className="lockbtn" onClick={()=>editMode?setEditMode(false):tryEdit()}>{editMode?"Done":"✎ Edit"}</button>
+        </div>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:18}}>
+          <Stat big={standing} unit={`of ${OWNERS.length}`} label="players still standing"/>
+          <Stat big={teamsLeft} unit="teams" label="still in the cup"/>
+          <div className="card statcard" style={{flex:"1 1 150px"}}>
+            <div style={{font:"700 10px/1 Inter",letterSpacing:"1.5px",color:C.muted,textTransform:"uppercase"}}>Out in front</div>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8}}><Crest owner={leader.owner} size={26}/><span className="display" style={{fontSize:22,color:C.text}}>{leader.owner}</span><span style={{marginLeft:"auto",fontSize:15}}>👑</span></div>
+          </div>
+        </div>
+        <SyncBar state={state} syncing={syncing} onSync={doSync}/>
+      </div>
+
+      <div className="tabs">{TABS.map(([k,l])=><button key={k} className={"tab"+(tab===k?" active":"")} onClick={()=>setTab(k)}>{l}</button>)}</div>
+
+      <div style={{padding:"4px 14px 60px"}}>
+        {tab==="leaderboard" && <Leaderboard A={A}/>}
+        {tab==="h2h" && <HeadToHead A={A}/>}
+        {tab==="groups" && <GroupsView A={A}/>}
+        {tab==="knockouts" && <KnockoutsView state={state} A={A} editMode={editMode} persist={persist}/>}
+        {tab==="awards" && <AwardsView state={state} A={A} editMode={editMode} persist={persist}/>}
+        {tab==="enter" && editMode && <ResultsEntry state={state} persist={persist} config={config} persistConfig={persistConfig}/>}
+      </div>
+
+      <footer style={{padding:"18px 18px 32px",borderTop:`1px solid ${C.line}`,color:C.muted,font:"500 12px/1.6 Inter"}}>
+        Share this URL with the family — everyone sees the same live data. {editMode?"You're editing: scores you type are locked and won't be overwritten by the sync.":"Only the passcode holder can edit; everyone else just watches."}
+        <div style={{marginTop:6,opacity:.7}}>Results sync via live web search; trophy odds use bookmaker prices re-normalised across surviving teams. The latest results load each time you open the page — tap “Sync now” to refresh again.</div>
+      </footer>
+
+      {askPin && <PinModal correct={config.passcode} onClose={()=>setAskPin(false)} onOK={()=>{setEditMode(true);setAskPin(false);}}/>}
+    </Shell>
+  );
+}
+
+/* ============================================================
+   LIVE SYNC  (Anthropic web search, batched for reliability)
+   ============================================================ */
+const TODAY_STR = new Date().toDateString();
+async function aiSearchJSON(prompt){
+  const res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:1000,messages:[{role:"user",content:prompt}],tools:[{type:"web_search_20250305",name:"web_search"}]})});
+  if(!res.ok) throw new Error("HTTP "+res.status);
+  const data=await res.json();
+  const text=(data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
+  const s=text.indexOf("["), e=text.lastIndexOf("]");
+  if(s<0||e<0) return [];
+  try{ const arr=JSON.parse(text.slice(s,e+1)); return Array.isArray(arr)?arr:[]; }catch(_){ return []; }
+}
+function groupPrompt(letters){
+  const lines=letters.map(L=>`Group ${L} (${GROUPS[L].join(", ")})`).join(" and ");
+  return `Use web search to find FINISHED match results so far at the 2026 FIFA World Cup for ${lines}. Today is ${TODAY_STR}. Return ONLY a JSON array, no prose or markdown: [{"a":"Team","b":"Team","ga":0,"gb":0}]. Include only matches already completed (full time). Use exactly these team names. If none have finished, return [].`;
+}
+const KO_PROMPT=`Use web search to find FINISHED knockout-stage results at the 2026 FIFA World Cup (Round of 32 onward). Today is ${TODAY_STR}. Return ONLY a JSON array, no prose: [{"round":"Round of 32|Round of 16|Quarter-final|Semi-final|Third place|Final","a":"Team","b":"Team","ga":0,"gb":0,"pa":null,"pb":null}]. Only completed matches; pa/pb are penalty-shootout scores or null. Use exact country names. If none yet, return [].`;
+const SCORERS_PROMPT=`Use web search to find the current TOP GOALSCORERS at the 2026 FIFA World Cup. Today is ${TODAY_STR}. Return ONLY a JSON array, top 10 highest first, no prose: [{"p":"Player full name","t":"Team","g":0}]. Use exact country names. If unclear this early, return [].`;
+
+async function fetchSearch(){
+  const groupBatches=[["A","B","C"],["D","E","F"],["G","H","I"],["J","K","L"]];
+  const jobs=[ ...groupBatches.map(g=>({type:"group",prompt:groupPrompt(g)})),
+    {type:"ko",prompt:KO_PROMPT}, {type:"sc",prompt:SCORERS_PROMPT} ];
+  const settled=await Promise.allSettled(jobs.map(j=>aiSearchJSON(j.prompt)));
+  if(!settled.some(s=>s.status==="fulfilled")) throw new Error("search unavailable");
+  const results=[], scorers=[];
+  settled.forEach((s,i)=>{
+    if(s.status!=="fulfilled") return; const arr=Array.isArray(s.value)?s.value:[]; const type=jobs[i].type;
+    if(type==="group") arr.forEach(m=>{ const a=normTeam(m.a),b=normTeam(m.b);
+      if(OWNER_OF[a]&&OWNER_OF[b]&&FIXTURE_INDEX[[a,b].sort().join("|")]&&m.ga!=null&&m.gb!=null&&Number.isFinite(+m.ga)&&Number.isFinite(+m.gb))
+        results.push({stage:"group",a,b,ga:+m.ga,gb:+m.gb,pa:null,pb:null}); });
+    else if(type==="ko") arr.forEach(m=>{ const a=normTeam(m.a),b=normTeam(m.b); const round=KO_ORDER.includes(m.round)?m.round:null;
+      if(round&&OWNER_OF[a]&&OWNER_OF[b]&&m.ga!=null&&m.gb!=null&&Number.isFinite(+m.ga)&&Number.isFinite(+m.gb))
+        results.push({stage:round,a,b,ga:+m.ga,gb:+m.gb,pa:m.pa==null?null:+m.pa,pb:m.pb==null?null:+m.pb}); });
+    else arr.forEach(x=>{ const t=normTeam(x.t); if(OWNER_OF[t]&&x.p&&x.g!=null&&Number.isFinite(+x.g)) scorers.push({p:String(x.p),t,g:+x.g}); });
+  });
+  return { results, scorers: scorers.sort((a,b)=>b.g-a.g).slice(0,15) };
+}
+
+/* ---- ESPN public feed: complete, every group, every match (works on a normal web page / GitHub Pages) ---- */
+const ESPN_URL="https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard";
+function allTournamentDates(){ const out=[],start=Date.UTC(2026,5,11),end=Date.UTC(2026,6,19);
+  for(let t=start;t<=end;t+=86400000){const d=new Date(t);out.push(`${d.getUTCFullYear()}${String(d.getUTCMonth()+1).padStart(2,"0")}${String(d.getUTCDate()).padStart(2,"0")}`);} return out; }
+function numOrNull(v){const n=parseInt(v,10);return Number.isFinite(n)?n:null;}
+function resolveTeam(team){ if(!team) return null;
+  for(const f of [team.displayName,team.shortDisplayName,team.name,team.location,team.abbreviation]){ const r=normTeam(f); if(r&&OWNER_OF[r]) return r; }
+  const c=String(team.displayName||team.name||"").toLowerCase();
+  return ALL_TEAMS.find(t=>{const tl=t.toLowerCase();return c&&(c.includes(tl)||tl.includes(c));})||null; }
+function espnStage(ev,comp,a,b){ if(FIXTURE_INDEX[[a,b].sort().join("|")]) return "group";
+  const txt=((comp?.notes?.[0]?.headline)||ev.name||ev.shortName||"").toLowerCase();
+  if(/round of 32|r32/.test(txt))return"Round of 32"; if(/round of 16|r16/.test(txt))return"Round of 16";
+  if(/quarter/.test(txt))return"Quarter-final"; if(/semi/.test(txt))return"Semi-final"; if(/third|3rd|play-?off/.test(txt))return"Third place"; if(/final/.test(txt))return"Final";
+  const d=new Date(ev.date),md=(d.getUTCMonth()+1)*100+d.getUTCDate();
+  if(md>=628&&md<=703)return"Round of 32"; if(md>=704&&md<=708)return"Round of 16"; if(md>=709&&md<=712)return"Quarter-final"; if(md>=713&&md<=716)return"Semi-final"; if(md===718)return"Third place"; if(md>=717)return"Final"; return"Round of 32"; }
+async function fetchESPN(){
+  const settled=await Promise.allSettled(allTournamentDates().map(d=>
+    fetch(`${ESPN_URL}?dates=${d}&limit=100`).then(r=>{ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })));
+  const ok=settled.filter(s=>s.status==="fulfilled");
+  if(!ok.length) throw new Error("ESPN unreachable");
+  const events=[], seen=new Set();
+  ok.forEach(s=>(s.value.events||[]).forEach(ev=>{ if(ev.id&&!seen.has(ev.id)){ seen.add(ev.id); events.push(ev); } }));
+  if(!events.length) throw new Error("ESPN returned nothing");
+  const results=[], scorerMap={};
+  events.forEach(ev=>{ const comp=ev.competitions?.[0]; if(!comp) return;
+    const cs=comp.competitors||[]; const home=cs.find(c=>c.homeAway==="home")||cs[0]; const away=cs.find(c=>c.homeAway==="away")||cs[1]; if(!home||!away) return;
+    const a=resolveTeam(home.team), b=resolveTeam(away.team); if(!a||!b) return;
+    if(!(comp.status?.type?.completed ?? (comp.status?.type?.state==="post"))) return;
+    const ga=parseInt(home.score,10), gb=parseInt(away.score,10); if(!Number.isFinite(ga)||!Number.isFinite(gb)) return;
+    results.push({stage:espnStage(ev,comp,a,b),a,b,ga,gb,pa:numOrNull(home.shootoutScore),pb:numOrNull(away.shootoutScore)});
+    (comp.details||[]).forEach(d=>{ const tx=(d?.type?.text||"").toLowerCase();
+      if(d.scoringPlay && !/own goal/.test(tx)){ const nm=d.athletesInvolved?.[0]?.displayName; if(!nm) return;
+        const tm=d.team?.id===home.team?.id?a:b; const k=nm+"|"+tm; (scorerMap[k]=scorerMap[k]||{p:nm,t:tm,g:0}).g++; } });
+  });
+  const scorers=Object.values(scorerMap).filter(s=>OWNER_OF[s.t]).sort((x,y)=>y.g-x.g).slice(0,15);
+  return { results, scorers };
+}
+async function fetchLive(){
+  try{ return await fetchESPN(); }                  // primary: complete + accurate on a normal page
+  catch(eE){ try{ return await fetchSearch(); }     // fallback: web search (used inside the Claude sandbox)
+    catch(eS){ throw new Error(`sync failed — ${eE.message}`); } }
+}
+
+function mergeLive(prev,p){
+  const next={...prev}; const gr={...prev.groupResults}; const ko=[...prev.ko];
+  (p.results||[]).forEach(m=>{
+    if(m.stage==="group"){
+      const hit=FIXTURE_INDEX[[m.a,m.b].sort().join("|")]; if(!hit) return;
+      const cur=gr[hit.fx.id]; if(cur&&cur.src==="manual") return;
+      const fwd=hit.fx.a===m.a; gr[hit.fx.id]={hs:fwd?m.ga:m.gb,as:fwd?m.gb:m.ga,src:"auto"};
+    } else {
+      const round=m.stage; const key=[m.a,m.b].sort().join("|");
+      const i=ko.findIndex(x=>x.round===round && [x.a,x.b].sort().join("|")===key);
+      if(i>=0 && ko[i].src==="manual") return;
+      const A=i<0?m.a:ko[i].a; const fwd=A===m.a;
+      const rec={id:i<0?`ko-${round}-${key}`:ko[i].id,round,a:A,b:i<0?m.b:ko[i].b,
+        hs:fwd?m.ga:m.gb,as:fwd?m.gb:m.ga,pa:m.pa==null?null:(fwd?m.pa:m.pb),pb:m.pb==null?null:(fwd?m.pb:m.pa),src:"auto"};
+      if(i<0) ko.push(rec); else ko[i]=rec;
+    }
+  });
+  next.groupResults=gr; next.ko=ko;
+  next.autoScorers=(p.scorers||[]).filter(s=>OWNER_OF[s.t]).slice(0,20);
+  next.lastSync=new Date().toISOString(); next.syncError=null;
+  return next;
+}
+
+/* ============================================================ ANALYSIS ============================================================ */
+function analyse(state){
+  const results=state.groupResults||{}, ko=state.ko||[], awards=state.awards||{}, odds=state.odds||{};
+  const standings={},complete={},rankOf={};
+  GROUP_LETTERS.forEach(L=>{ standings[L]=computeStandings(L,results); complete[L]=groupDone(L,results); standings[L].forEach(s=>rankOf[s.name]=s.rank); });
+  const allComplete=GROUP_LETTERS.every(L=>complete[L]);
+  let thirdAdv=new Set();
+  if(allComplete){ const th=GROUP_LETTERS.map(L=>standings[L][2]); th.sort((a,b)=>b.pts-a.pts||b.gd-a.gd||b.gf-a.gf||strength(b.name)-strength(a.name)); th.slice(0,8).forEach(t=>thirdAdv.add(t.name)); }
+
+  const koLosers=new Set(); const koStats={}; ALL_TEAMS.forEach(t=>koStats[t]={p:0,w:0,d:0,l:0,gf:0,ga:0});
+  const clashes=[];
+  const add=(stage,a,b,ga,gb,pens)=>clashes.push({stage,a,b,ga,gb,pens,oa:OWNER_OF[a],ob:OWNER_OF[b]});
+  GROUP_LETTERS.forEach(L=>FIXTURES[L].forEach(fx=>{const r=results[fx.id]; if(r&&r.hs!=null) add("Group "+L,fx.a,fx.b,r.hs,r.as,null);}));
+  ko.forEach(m=>{ if(m.hs==null||m.as==null) return; const SA=koStats[m.a],SB=koStats[m.b];
+    if(SA&&SB){SA.p++;SB.p++;SA.gf+=m.hs;SA.ga+=m.as;SB.gf+=m.as;SB.ga+=m.hs; if(m.hs>m.as){SA.w++;SB.l++;}else if(m.hs<m.as){SB.w++;SA.l++;}else{SA.d++;SB.d++;}}
+    const wl=koWL(m); if(wl) koLosers.add(wl.l); add(m.round,m.a,m.b,m.hs,m.as,(m.pa!=null&&m.pb!=null)?[m.pa,m.pb]:null); });
+
+  const teamOut={};
+  ALL_TEAMS.forEach(t=>{ if(koLosers.has(t)){teamOut[t]=true;return;} const L=GROUP_OF[t];
+    if(complete[L]){const r=rankOf[t]; if(r===4){teamOut[t]=true;return;} if(r===3){teamOut[t]=allComplete?!thirdAdv.has(t):false;return;}} teamOut[t]=false; });
+
+  const groupStats={}; GROUP_LETTERS.forEach(L=>standings[L].forEach(s=>groupStats[s.name]=s));
+  const owner={}; OWNERS.forEach(o=>owner[o]={owner:o,p:0,w:0,d:0,l:0,gf:0,ga:0,teams:[],teamsLeft:0});
+  ALL_TEAMS.forEach(t=>{const o=OWNER_OF[t],g=groupStats[t],k=koStats[t],O=owner[o];
+    O.p+=g.p+k.p;O.w+=g.w+k.w;O.d+=g.d+k.d;O.l+=g.l+k.l;O.gf+=g.gf+k.gf;O.ga+=g.ga+k.ga;O.teams.push(t); if(!teamOut[t])O.teamsLeft++;});
+  OWNERS.forEach(o=>{const O=owner[o];O.gd=O.gf-O.ga;O.pts=O.w*3+O.d;O.out=O.teamsLeft===0;});
+
+  const w=t=>1/((odds[t]??BASE_ODDS[t])??1500);
+  const inTotal=ALL_TEAMS.filter(t=>!teamOut[t]).reduce((s,t)=>s+w(t),0)||1;
+  OWNERS.forEach(o=>{ owner[o].odds=awards.champion?(OWNER_OF[awards.champion]===o?100:0):owner[o].teams.filter(t=>!teamOut[t]).reduce((s,t)=>s+w(t),0)/inTotal*100; });
+  const ownerRanked=[...OWNERS].map(o=>owner[o]).sort((a,b)=>(a.out?1:0)-(b.out?1:0)||b.odds-a.odds||b.pts-a.pts||b.gd-a.gd);
+
+  // head-to-head (cross-owner only, all fixtures)
+  const h2h={}; OWNERS.forEach(o=>h2h[o]={owner:o,p:0,w:0,d:0,l:0,gf:0,ga:0});
+  const cross=clashes.filter(c=>c.oa!==c.ob);
+  cross.forEach(c=>{const A=h2h[c.oa],B=h2h[c.ob]; A.p++;B.p++;A.gf+=c.ga;A.ga+=c.gb;B.gf+=c.gb;B.ga+=c.ga;
+    let r; if(c.ga>c.gb)r="a"; else if(c.ga<c.gb)r="b"; else if(c.pens)r=c.pens[0]>c.pens[1]?"a":"b"; else r="d";
+    if(r==="a"){A.w++;B.l++;}else if(r==="b"){B.w++;A.l++;}else{A.d++;B.d++;}});
+  OWNERS.forEach(o=>{const H=h2h[o];H.gd=H.gf-H.ga;H.pts=H.w*3+H.d;});
+  const h2hRanked=[...OWNERS].map(o=>h2h[o]).sort((a,b)=>b.pts-a.pts||b.gd-a.gd||b.gf-a.gf||b.w-a.w);
+
+  // golden boot: auto + manual scorers
+  const scMap=new Map();
+  (state.autoScorers||[]).forEach(s=>{if(OWNER_OF[s.t])scMap.set(s.p+"|"+s.t,{p:s.p,t:s.t,g:s.g,src:"auto"});});
+  (state.scorers||[]).forEach(s=>{if(OWNER_OF[s.t])scMap.set(s.p+"|"+s.t,{p:s.p,t:s.t,g:s.g,src:"manual"});});
+  const scorers=[...scMap.values()].sort((a,b)=>b.g-a.g).slice(0,15);
+
+  // golden glove: clean sheets per team derived from all results
+  const cs={}; ALL_TEAMS.forEach(t=>cs[t]=0);
+  GROUP_LETTERS.forEach(L=>FIXTURES[L].forEach(fx=>{const r=results[fx.id]; if(r&&r.hs!=null){ if(r.as===0)cs[fx.a]++; if(r.hs===0)cs[fx.b]++; }}));
+  ko.forEach(m=>{ if(m.hs!=null&&m.as!=null){ if(m.as===0)cs[m.a]++; if(m.hs===0)cs[m.b]++; }});
+  const keeperName={}; (state.keepers||[]).forEach(k=>{if(OWNER_OF[k.t])keeperName[k.t]=k.p;});
+  const cleanSheets=ALL_TEAMS.map(t=>({t,owner:OWNER_OF[t],cs:cs[t],keeper:keeperName[t]||null})).filter(x=>x.cs>0).sort((a,b)=>b.cs-a.cs||strength(b.t)-strength(a.t)).slice(0,15);
+
+  return { standings,complete,allComplete,teamOut,owner,ownerRanked,awards,h2hRanked,
+    crossClashes:cross.slice().reverse(), scorers, cleanSheets, bootLeader:scorers[0]||null, gloveLeader:cleanSheets[0]||null };
+}
+
+/* ============================================================ VIEWS ============================================================ */
+function SyncBar({state,syncing,onSync}){
+  const last=state.lastSync?timeAgo(state.lastSync):"never";
+  const dot=syncing?C.gold:(state.syncError?C.red:C.green);
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:10,marginTop:14,padding:"9px 12px",border:`1px solid ${C.line}`,borderRadius:12,background:"rgba(255,255,255,.02)"}}>
+      <span style={{width:8,height:8,borderRadius:"50%",background:dot,boxShadow:syncing?`0 0 8px ${C.gold}`:"none"}}/>
+      <span style={{font:"600 11px Inter",color:C.muted,minWidth:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+        {syncing?"Syncing latest results…":state.syncError?`Sync failed — ${state.syncError}`:`Updated ${last}`}
+      </span>
+      <button className="xbtn" style={{marginLeft:"auto",padding:"5px 12px"}} onClick={onSync} disabled={syncing}>Sync now</button>
+    </div>
+  );
+}
+
+function Leaderboard({A}){
+  return (
+    <div style={{display:"grid",gap:10,paddingTop:12}}>
+      {A.ownerRanked.map((O,i)=>{ const lead=i===0&&!O.out;
+        return (
+          <div key={O.owner} className="card" style={{padding:14,opacity:O.out?.55:1,borderColor:lead?C.gold:C.line,boxShadow:lead?`0 0 0 1px ${C.gold},0 8px 30px -16px ${C.gold}`:"none"}}>
+            <div style={{display:"flex",alignItems:"center",gap:12}}>
+              <div className="display" style={{fontSize:26,width:24,textAlign:"center",color:O.out?C.muted:C.gold}}>{i+1}</div>
+              <Crest owner={O.owner} size={34}/>
+              <div style={{minWidth:0}}>
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <span className="display" style={{fontSize:22,color:C.text}}>{O.owner}</span>
+                  {lead&&<span style={{fontSize:15}}>👑</span>}
+                  <span className={"pill "+(O.out?"out":"in")}>{O.out?"OUT":"IN"}</span>
+                </div>
+                <div style={{font:"600 11px Inter",color:C.muted,marginTop:2}}>{O.teamsLeft}/{O.teams.length} teams left</div>
+              </div>
+              <div style={{marginLeft:"auto",textAlign:"right"}}>
+                <div className="display" style={{fontSize:24,lineHeight:1,color:O.out?C.muted:C.gold}}>{O.odds.toFixed(1)}%</div>
+                <div style={{font:"700 9px Inter",letterSpacing:"1px",color:C.muted,textTransform:"uppercase"}}>trophy odds</div>
+              </div>
+            </div>
+            <div style={{height:4,borderRadius:4,background:"rgba(255,255,255,.07)",marginTop:12,overflow:"hidden"}}><div style={{height:"100%",width:`${Math.min(100,O.odds)}%`,background:O.out?C.muted:`linear-gradient(90deg,${C.goldDeep},${C.gold})`}}/></div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:5,marginTop:11}}>{O.teams.map(t=><span key={t} className={"chip"+(A.teamOut[t]?" out":"")}><FlagDot team={t}/>{t}</span>)}</div>
+          </div>);})}
+    </div>
+  );
+}
+
+function HeadToHead({A}){
+  return (
+    <div style={{paddingTop:14}}>
+      <p style={{font:"500 12px/1.5 Inter",color:C.muted,margin:"0 2px 12px"}}>The real head-to-head: only matches where two players' teams actually met. All such fixtures count toward the table below (a knockout settled on penalties is a draw).</p>
+      <div style={{overflowX:"auto",border:`1px solid ${C.line}`,borderRadius:14,marginBottom:16}}>
+        <table className="lt"><thead><tr><th style={{textAlign:"left",paddingLeft:14}}>Player</th><th>P</th><th>W</th><th>D</th><th>L</th><th>GF</th><th>GA</th><th>GD</th><th className="sorted">Pts</th></tr></thead>
+          <tbody>{A.h2hRanked.map(O=>(
+            <tr key={O.owner}><td style={{textAlign:"left",paddingLeft:14}}><span style={{display:"inline-flex",alignItems:"center",gap:8}}><Crest owner={O.owner} size={22}/><b style={{color:C.text}}>{O.owner}</b></span></td>
+              <td>{O.p}</td><td>{O.w}</td><td>{O.d}</td><td>{O.l}</td><td>{O.gf}</td><td>{O.ga}</td><td>{O.gd>=0?"+":""}{O.gd}</td><td className="sorted"><b style={{color:C.text}}>{O.pts}</b></td></tr>))}</tbody>
+        </table>
+      </div>
+      <div className="display" style={{fontSize:15,color:C.gold,margin:"4px 2px 8px"}}>The clashes</div>
+      {A.crossClashes.length===0 && <div className="card" style={{padding:18,textAlign:"center",color:C.muted,font:"500 13px Inter"}}>No two players' teams have met yet.</div>}
+      <div style={{display:"grid",gap:8}}>{A.crossClashes.map((c,i)=>{
+        const win=c.ga>c.gb?c.oa:c.ga<c.gb?c.ob:c.pens?(c.pens[0]>c.pens[1]?c.oa:c.ob):null;
+        return (
+          <div key={i} className="card" style={{padding:"10px 12px"}}>
+            <div style={{font:"700 9px Inter",letterSpacing:"1px",color:C.muted,textTransform:"uppercase",marginBottom:6}}>{c.stage}</div>
+            <ClashSide team={c.a} owner={c.oa} score={c.ga} pen={c.pens?c.pens[0]:null} lose={win&&win!==c.oa}/>
+            <div style={{height:1,background:C.line,margin:"2px 0"}}/>
+            <ClashSide team={c.b} owner={c.ob} score={c.gb} pen={c.pens?c.pens[1]:null} lose={win&&win!==c.ob}/>
+            <div style={{font:"700 10px Inter",color:win?OWNER_COLOR[win]:C.muted,marginTop:6,textAlign:"right"}}>{win?`${win} wins the bragging rights`:"Honours even"}</div>
+          </div>);})}</div>
+    </div>
+  );
+}
+function ClashSide({team,owner,score,pen,lose}){
+  return (<div style={{display:"flex",alignItems:"center",gap:8,padding:"5px 0",opacity:lose?.55:1}}>
+    <FlagDot team={team}/><span style={{font:"600 14px Inter",color:C.text}}>{team}</span>
+    <span className="owntag" style={{color:OWNER_COLOR[owner]}}>{owner}</span>
+    <span className="display" style={{marginLeft:"auto",fontSize:20,color:C.text}}>{score}{pen!=null?<sup style={{fontSize:10,color:C.gold}}> ({pen})</sup>:null}</span></div>);
+}
+
+function GroupsView({A}){
+  return (
+    <div style={{paddingTop:14,display:"grid",gap:14}}>
+      {GROUP_LETTERS.map(L=>{const st=A.standings[L];
+        return (
+          <div key={L} className="card" style={{padding:"12px 12px 6px"}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}><span className="display" style={{fontSize:18,color:C.gold}}>Group {L}</span><span style={{font:"600 10px Inter",color:C.muted,letterSpacing:"1px",textTransform:"uppercase"}}>{A.complete[L]?"complete":"in progress"}</span></div>
+            <table className="grp"><thead><tr><th></th><th style={{textAlign:"left"}}>Team</th><th>P</th><th>W</th><th>D</th><th>L</th><th>GF</th><th>GA</th><th>GD</th><th>Pts</th></tr></thead>
+              <tbody>{st.map(s=>{const out=A.teamOut[s.name];
+                return (<tr key={s.name} style={{opacity:out?.45:1}}>
+                  <td><span className="rankdot" style={{background:s.rank<=2?C.green:s.rank===3?(out?C.red:C.gold):C.red}}>{s.rank}</span></td>
+                  <td style={{textAlign:"left"}}><span style={{display:"inline-flex",alignItems:"center",gap:6}}><FlagDot team={s.name}/><span style={{color:C.text}}>{s.name}</span><span className="owntag" style={{color:OWNER_COLOR[OWNER_OF[s.name]]}}>{OWNER_OF[s.name]}</span></span></td>
+                  <td>{s.p}</td><td>{s.w}</td><td>{s.d}</td><td>{s.l}</td><td>{s.gf}</td><td>{s.ga}</td><td>{s.gd>=0?"+":""}{s.gd}</td><td><b style={{color:C.text}}>{s.pts}</b></td></tr>);})}</tbody>
+            </table>
+          </div>);})}
+      <div style={{display:"flex",gap:14,flexWrap:"wrap",font:"600 11px Inter",color:C.muted,padding:"2px 4px"}}>
+        <span><i className="rankdot" style={{background:C.green}}/> Top 2 — through</span><span><i className="rankdot" style={{background:C.gold}}/> 3rd — best 8 go through</span><span><i className="rankdot" style={{background:C.red}}/> Out</span>
+      </div>
+    </div>
+  );
+}
+
+function KnockoutsView({state,A,editMode,persist}){
+  const ko=state.ko||[]; const rounds=KO_ORDER.map(r=>[r,ko.filter(m=>m.round===r)]).filter(([,m])=>m.length||editMode);
+  return (
+    <div style={{paddingTop:14}}>
+      {ko.length===0 && !editMode && <div className="card" style={{padding:20,textAlign:"center",color:C.muted,font:"500 13px Inter"}}>Knockouts haven't started. Round of 32 begins 28 June; results sync in automatically.</div>}
+      {rounds.map(([round,matches])=>(
+        <div key={round} style={{marginBottom:18}}>
+          <div className="display" style={{fontSize:16,color:C.gold,margin:"4px 2px 8px"}}>{round}</div>
+          <div style={{display:"grid",gap:8}}>{matches.map(m=><KoCard key={m.id} m={m}/>)}{matches.length===0&&<div style={{font:"500 12px Inter",color:C.muted,padding:"2px 4px"}}>No matches yet.</div>}</div>
+        </div>))}
+      {editMode && <KoEditor state={state} persist={persist}/>}
+    </div>
+  );
+}
+function KoCard({m}){ const wl=koWL(m);
+  const row=(team,score,pen)=>(<div style={{display:"flex",alignItems:"center",gap:8,padding:"7px 0",opacity:wl&&wl.l===team?.5:1}}>
+    <FlagDot team={team}/><span style={{color:C.text,font:"600 14px Inter"}}>{team}</span><span className="owntag" style={{color:OWNER_COLOR[OWNER_OF[team]]}}>{OWNER_OF[team]}</span>
+    {wl&&wl.w===team&&<span style={{marginLeft:"auto",font:"700 11px Inter",color:C.green}}>WON</span>}
+    <span className="display" style={{marginLeft:wl&&wl.w===team?8:"auto",fontSize:20,color:C.text}}>{score==null?"–":score}{pen!=null?<sup style={{fontSize:11,color:C.gold}}> ({pen})</sup>:null}</span></div>);
+  return <div className="card" style={{padding:"4px 14px"}}>{row(m.a,m.hs,m.pa)}<div style={{height:1,background:C.line}}/>{row(m.b,m.as,m.pb)}</div>;
+}
+function KoEditor({state,persist}){
+  const [round,setRound]=useState("Round of 32");
+  const [a,setA]=useState(""),[b,setB]=useState(""),[hs,setHs]=useState(""),[as_,setAs]=useState(""),[pa,setPa]=useState(""),[pb,setPb]=useState("");
+  function addM(){ if(!a||!b||a===b)return; const m={id:`ko-${Date.now()}`,round,a,b,hs:hs===""?null:+hs,as:as_===""?null:+as_,pa:pa===""?null:+pa,pb:pb===""?null:+pb,src:"manual"};
+    persist({...state,ko:[...(state.ko||[]),m]}); setA("");setB("");setHs("");setAs("");setPa("");setPb(""); }
+  function del(id){ persist({...state,ko:(state.ko||[]).filter(m=>m.id!==id)}); }
+  return (
+    <div className="card" style={{padding:14,marginTop:6}}>
+      <div className="display" style={{fontSize:15,color:C.text,marginBottom:10}}>Add / correct a knockout match</div>
+      <label className="lbl">Round</label><select className="inp" value={round} onChange={e=>setRound(e.target.value)}>{KO_ORDER.map(r=><option key={r}>{r}</option>)}</select>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 60px 42px",gap:8,marginTop:10,alignItems:"end"}}>
+        <div><label className="lbl">Team A</label><TeamSelect value={a} onChange={setA}/></div><div><label className="lbl">Goals</label><input className="inp" type="number" min="0" value={hs} onChange={e=>setHs(e.target.value)}/></div><div><label className="lbl">Pens</label><input className="inp" type="number" min="0" value={pa} onChange={e=>setPa(e.target.value)}/></div>
+        <div><label className="lbl">Team B</label><TeamSelect value={b} onChange={setB}/></div><div><input className="inp" type="number" min="0" value={as_} onChange={e=>setAs(e.target.value)}/></div><div><input className="inp" type="number" min="0" value={pb} onChange={e=>setPb(e.target.value)}/></div>
+      </div>
+      <button className="btn" style={{marginTop:12}} onClick={addM}>Save match</button>
+      {(state.ko||[]).length>0 && <div style={{marginTop:14}}>{(state.ko||[]).map(m=>(
+        <div key={m.id} style={{display:"flex",alignItems:"center",gap:8,font:"500 12px Inter",color:C.muted,padding:"4px 0"}}><span style={{width:88}}>{m.round}</span><span style={{color:C.text}}>{m.a} {m.hs??"–"}–{m.as??"–"} {m.b}</span><button className="xbtn" style={{marginLeft:"auto"}} onClick={()=>del(m.id)}>Remove</button></div>))}</div>}
+    </div>
+  );
+}
+
+function AwardsView({state,A,editMode,persist}){
+  const aw=state.awards||{}; const champ=aw.champion, champO=champ?OWNER_OF[champ]:null;
+  return (
+    <div style={{paddingTop:14,display:"grid",gap:14}}>
+      <ScorerBoard A={A} state={state} editMode={editMode} persist={persist}/>
+      <GloveBoard A={A} state={state} editMode={editMode} persist={persist}/>
+
+      <div className="card" style={{padding:14}}>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <span style={{fontSize:22}}>👑</span>
+          <div><div className="display" style={{fontSize:17,color:C.gold}}>Champions</div><div style={{font:"500 11px Inter",color:C.muted}}>Winners of the World Cup</div></div>
+          {champO&&<div style={{marginLeft:"auto",textAlign:"right"}}><div style={{display:"flex",alignItems:"center",gap:6,justifyContent:"flex-end"}}><Crest owner={champO} size={22}/><b className="display" style={{fontSize:18,color:C.text}}>{champO}</b></div><div style={{font:"600 11px Inter",color:C.muted}}>{champ}</div></div>}
+        </div>
+        {editMode && <div style={{marginTop:10}}><TeamSelect value={champ||""} onChange={v=>persist({...state,awards:{...aw,champion:v||null}})} allowBlank/></div>}
+        {!editMode && !champO && <div style={{marginTop:8,font:"500 12px Inter",color:C.muted}}>Not decided yet.</div>}
+      </div>
+
+      <div className="card" style={{padding:14}}>
+        <div className="display" style={{fontSize:16,color:C.gold,marginBottom:4}}>Trophy odds — full breakdown</div>
+        <div style={{font:"500 11px Inter",color:C.muted,marginBottom:10}}>Live chance the champion comes from each player's surviving teams, built from bookmaker prices and re-normalised as teams drop out.</div>
+        {A.ownerRanked.map(O=>(<div key={O.owner} style={{display:"flex",alignItems:"center",gap:10,padding:"5px 0",opacity:O.out?.5:1}}>
+          <Crest owner={O.owner} size={20}/><span style={{width:70,color:C.text,font:"600 13px Inter"}}>{O.owner}</span>
+          <div style={{flex:1,height:8,borderRadius:6,background:"rgba(255,255,255,.06)",overflow:"hidden"}}><div style={{height:"100%",width:`${Math.min(100,O.odds)}%`,background:`linear-gradient(90deg,${C.goldDeep},${C.gold})`}}/></div>
+          <span className="display" style={{width:52,textAlign:"right",fontSize:16,color:C.gold}}>{O.odds.toFixed(1)}%</span></div>))}
+      </div>
+    </div>
+  );
+}
+
+function ScorerBoard({A,state,editMode,persist}){
+  const list=A.scorers, leader=A.bootLeader;
+  const [p,setP]=useState(""),[t,setT]=useState(""),[g,setG]=useState("");
+  function addP(){ if(!p||!t||g==="")return; const ex=(state.scorers||[]).filter(x=>!(x.p===p&&x.t===t));
+    persist({...state,scorers:[...ex,{p,t,g:+g}]}); setP("");setT("");setG(""); }
+  function del(pp,tt){ persist({...state,scorers:(state.scorers||[]).filter(x=>!(x.p===pp&&x.t===tt))}); }
+  return (
+    <div className="card" style={{padding:14}}>
+      <BoardHead emoji="⚽" title="Golden Boot" sub="Top scorers — most goals" holder={leader?OWNER_OF[leader.t]:null}/>
+      {list.length===0 && <div style={{font:"500 12px Inter",color:C.muted}}>No goals recorded yet — syncs in live, or add scorers in edit mode.</div>}
+      <div style={{display:"grid",gap:2}}>{list.map((s,i)=>(
+        <div key={s.p+s.t} style={{display:"flex",alignItems:"center",gap:9,padding:"6px 0",borderTop:i?"1px solid rgba(255,255,255,.05)":"none"}}>
+          <span className="display" style={{width:18,textAlign:"center",fontSize:15,color:i===0?C.gold:C.muted}}>{i+1}</span>
+          <span style={{font:"600 13px Inter",color:C.text}}>{s.p}</span>
+          <span style={{display:"inline-flex",alignItems:"center",gap:5}}><FlagDot team={s.t}/><span style={{font:"500 11px Inter",color:C.muted}}>{s.t}</span></span>
+          <span className="owntag" style={{color:OWNER_COLOR[OWNER_OF[s.t]]}}>{OWNER_OF[s.t]}</span>
+          <span className="display" style={{marginLeft:"auto",fontSize:18,color:C.text}}>{s.g}</span>
+          {editMode && s.src==="manual" && <button className="xbtn" style={{padding:"3px 7px"}} onClick={()=>del(s.p,s.t)}>×</button>}
+        </div>))}</div>
+      {editMode && <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 52px",gap:6,marginTop:10,alignItems:"end"}}>
+        <div><label className="lbl">Player</label><input className="inp" value={p} onChange={e=>setP(e.target.value)} placeholder="Name"/></div>
+        <div><label className="lbl">Team</label><TeamSelect value={t} onChange={setT}/></div>
+        <div><label className="lbl">Goals</label><input className="inp" type="number" min="0" value={g} onChange={e=>setG(e.target.value)}/></div>
+        <button className="btn" style={{gridColumn:"1 / -1"}} onClick={addP}>Add / update scorer</button></div>}
+    </div>
+  );
+}
+function GloveBoard({A,state,editMode,persist}){
+  const list=A.cleanSheets, leader=A.gloveLeader;
+  const [t,setT]=useState(""),[p,setP]=useState("");
+  function setKeeper(){ if(!t||!p)return; const ex=(state.keepers||[]).filter(x=>x.t!==t); persist({...state,keepers:[...ex,{p,t}]}); setT("");setP(""); }
+  return (
+    <div className="card" style={{padding:14}}>
+      <BoardHead emoji="🧤" title="Golden Glove" sub="Most clean sheets (by team)" holder={leader?leader.owner:null}/>
+      {list.length===0 && <div style={{font:"500 12px Inter",color:C.muted}}>No clean sheets yet.</div>}
+      <div style={{display:"grid",gap:2}}>{list.map((s,i)=>(
+        <div key={s.t} style={{display:"flex",alignItems:"center",gap:9,padding:"6px 0",borderTop:i?"1px solid rgba(255,255,255,.05)":"none"}}>
+          <span className="display" style={{width:18,textAlign:"center",fontSize:15,color:i===0?C.gold:C.muted}}>{i+1}</span>
+          <span style={{display:"inline-flex",alignItems:"center",gap:6}}><FlagDot team={s.t}/><span style={{font:"600 13px Inter",color:C.text}}>{s.t}</span></span>
+          {s.keeper && <span style={{font:"500 11px Inter",color:C.muted}}>· {s.keeper}</span>}
+          <span className="owntag" style={{color:OWNER_COLOR[s.owner]}}>{s.owner}</span>
+          <span className="display" style={{marginLeft:"auto",fontSize:18,color:C.text}}>{s.cs}</span>
+        </div>))}</div>
+      {editMode && <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginTop:10,alignItems:"end"}}>
+        <div><label className="lbl">Team</label><TeamSelect value={t} onChange={setT}/></div>
+        <div><label className="lbl">Keeper name (optional)</label><input className="inp" value={p} onChange={e=>setP(e.target.value)} placeholder="e.g. Donnarumma"/></div>
+        <button className="btn" style={{gridColumn:"1 / -1"}} onClick={setKeeper}>Name this team's keeper</button></div>}
+    </div>
+  );
+}
+function BoardHead({emoji,title,sub,holder}){
+  return (<div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+    <span style={{fontSize:22}}>{emoji}</span>
+    <div><div className="display" style={{fontSize:17,color:C.gold}}>{title}</div><div style={{font:"500 11px Inter",color:C.muted}}>{sub}</div></div>
+    {holder&&<div style={{marginLeft:"auto",textAlign:"right"}}><div style={{display:"flex",alignItems:"center",gap:6,justifyContent:"flex-end"}}><Crest owner={holder} size={20}/><b className="display" style={{fontSize:16,color:C.text}}>{holder}</b></div><div style={{font:"600 10px Inter",color:C.muted}}>holds it</div></div>}
+  </div>);
+}
+
+function ResultsEntry({state,persist,config,persistConfig}){
+  const results=state.groupResults||{};
+  function setScore(id,side,val){ const cur=results[id]||{hs:null,as:null}; persist({...state,groupResults:{...results,[id]:{...cur,[side]:val===""?null:Math.max(0,+val),src:"manual"}}}); }
+  function clear(id){ const nr={...results}; delete nr[id]; persist({...state,groupResults:nr}); }
+  const [pin,setPin]=useState(config.passcode||"");
+  return (
+    <div style={{paddingTop:14}}>
+      <div className="card" style={{padding:14,marginBottom:14}}>
+        <div className="display" style={{fontSize:15,color:C.text,marginBottom:6}}>Lock editing with a passcode</div>
+        <div style={{font:"500 12px/1.5 Inter",color:C.muted,marginBottom:10}}>Set a passcode so the family can watch but only you can edit. Leave blank to keep it open to anyone with the link.</div>
+        <div style={{display:"flex",gap:8}}><input className="inp" style={{flex:1}} value={pin} onChange={e=>setPin(e.target.value)} placeholder="e.g. 1966"/><button className="btn" onClick={()=>persistConfig({...config,passcode:pin.trim()||null})}>Save</button></div>
+      </div>
+      <p style={{font:"500 12px/1.5 Inter",color:C.muted,margin:"0 2px 10px"}}>Type a score and it locks — the sync won't touch matches you've entered. Clear it (×) to hand control back to auto-sync.</p>
+      {GROUP_LETTERS.map(L=>(
+        <div key={L} className="card" style={{padding:"10px 12px",marginBottom:10}}>
+          <div className="display" style={{fontSize:15,color:C.gold,marginBottom:6}}>Group {L}</div>
+          {[1,2,3].map(md=>(<div key={md} style={{marginBottom:6}}>
+            <div style={{font:"700 9px Inter",letterSpacing:"1px",color:C.muted,textTransform:"uppercase",margin:"6px 0 2px"}}>Matchday {md}</div>
+            {FIXTURES[L].filter(f=>f.md===md).map(fx=>{const r=results[fx.id]||{};
+              return (<div key={fx.id} style={{display:"grid",gridTemplateColumns:"1fr 38px 12px 38px 1fr 22px",alignItems:"center",gap:6,padding:"3px 0"}}>
+                <span style={{textAlign:"right",font:"600 12px Inter",color:C.text}}>{fx.a}</span>
+                <input className="score" type="number" min="0" value={r.hs??""} onChange={e=>setScore(fx.id,"hs",e.target.value)}/>
+                <span style={{textAlign:"center",color:C.muted}}>–</span>
+                <input className="score" type="number" min="0" value={r.as??""} onChange={e=>setScore(fx.id,"as",e.target.value)}/>
+                <span style={{font:"600 12px Inter",color:C.text}}>{fx.b}</span>
+                <button className="xbtn" style={{padding:"3px 6px"}} onClick={()=>clear(fx.id)} title="Clear">×</button></div>);})}
+          </div>))}
+        </div>))}
+    </div>
+  );
+}
+
+/* ============================================================ PIECES ============================================================ */
+function TeamSelect({value,onChange,allowBlank}){
+  return (<select className="inp" value={value} onChange={e=>onChange(e.target.value)}>
+    {allowBlank||!value?<option value="">— select —</option>:null}
+    {GROUP_LETTERS.map(L=><optgroup key={L} label={`Group ${L}`}>{GROUPS[L].map(t=><option key={t} value={t}>{t} ({OWNER_OF[t]})</option>)}</optgroup>)}
+  </select>);
+}
+function Crest({owner,size=28}){ return <span style={{width:size,height:size,borderRadius:"50%",flex:`0 0 ${size}px`,background:OWNER_COLOR[owner],display:"inline-flex",alignItems:"center",justifyContent:"center",font:`800 ${Math.round(size*.42)}px Inter`,color:"#0A0F1E"}}>{owner[0]}</span>; }
+function FlagDot({team}){ return <span style={{width:8,height:8,borderRadius:"50%",flex:"0 0 8px",background:OWNER_COLOR[OWNER_OF[team]]||C.muted}}/>; }
+function Stat({big,unit,label}){ return (<div className="card statcard" style={{flex:"1 1 120px"}}>
+  <div style={{display:"flex",alignItems:"baseline",gap:5}}><span className="display" style={{fontSize:30,color:C.text,lineHeight:1}}>{big}</span><span style={{font:"700 11px Inter",color:C.gold}}>{unit}</span></div>
+  <div style={{font:"600 10px/1.3 Inter",letterSpacing:".5px",color:C.muted,textTransform:"uppercase",marginTop:6}}>{label}</div></div>); }
+function PinModal({correct,onClose,onOK}){
+  const [v,setV]=useState(""),[err,setErr]=useState(false); const submit=()=>{ if(v===correct)onOK(); else setErr(true); };
+  return (<div className="overlay" onClick={onClose}><div className="card" style={{padding:20,width:280,maxWidth:"90vw"}} onClick={e=>e.stopPropagation()}>
+    <div className="display" style={{fontSize:18,color:C.text,marginBottom:6}}>Enter passcode</div>
+    <div style={{font:"500 12px Inter",color:C.muted,marginBottom:12}}>Needed to edit scores, players and the champion.</div>
+    <input autoFocus className="inp" value={v} onChange={e=>{setV(e.target.value);setErr(false);}} onKeyDown={e=>e.key==="Enter"&&submit()} placeholder="Passcode"/>
+    {err&&<div style={{color:C.red,font:"600 12px Inter",marginTop:8}}>That's not it — try again.</div>}
+    <div style={{display:"flex",gap:8,marginTop:14}}><button className="btn" style={{flex:1}} onClick={submit}>Unlock</button><button className="xbtn" onClick={onClose}>Cancel</button></div>
+  </div></div>);
+}
+function Shell({children}){ return <div style={{minHeight:"100vh",background:C.bg,color:C.text,fontFamily:"Inter,system-ui,sans-serif"}}><div style={{maxWidth:560,margin:"0 auto"}}>{children}</div></div>; }
+function timeAgo(iso){ const s=(Date.now()-Date.parse(iso))/1000; if(s<60)return "just now"; if(s<3600)return Math.floor(s/60)+"m ago"; if(s<86400)return Math.floor(s/3600)+"h ago"; return Math.floor(s/86400)+"d ago"; }
+
+const C={ bg:"#0A0F1E", panel:"#131B30", line:"rgba(255,255,255,.09)", text:"#EAF0FB", muted:"#8693AE", gold:"#F4C95D", goldDeep:"#D99B33", green:"#3FD78B", red:"#FB6B5B" };
+function Style(){ return <style>{`
+  @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Inter:wght@400;500;600;700;800&display=swap');
+  *{box-sizing:border-box}
+  .display{font-family:'Barlow Condensed',Inter,sans-serif;font-weight:800;text-transform:uppercase}
+  .card{background:${C.panel};border:1px solid ${C.line};border-radius:16px}
+  .statcard{padding:12px 14px}
+  .tabs{display:flex;gap:6px;overflow-x:auto;padding:14px 14px 6px;scrollbar-width:none}
+  .tabs::-webkit-scrollbar{display:none}
+  .tab{flex:0 0 auto;background:transparent;border:1px solid ${C.line};color:${C.muted};font:700 12px Inter;padding:8px 14px;border-radius:999px;cursor:pointer;white-space:nowrap;transition:.15s}
+  .tab:hover{color:${C.text}} .tab.active{background:${C.gold};border-color:${C.gold};color:#0A0F1E}
+  .lockbtn{background:transparent;border:1px solid ${C.line};color:${C.gold};font:700 12px Inter;padding:8px 14px;border-radius:999px;cursor:pointer;white-space:nowrap}
+  .lockbtn:hover{border-color:${C.gold}}
+  .pill{font:800 9px Inter;letter-spacing:.5px;padding:2px 7px;border-radius:6px}
+  .pill.in{background:rgba(63,215,139,.15);color:${C.green}} .pill.out{background:rgba(251,107,91,.15);color:${C.red}}
+  .chip{display:inline-flex;align-items:center;gap:5px;font:600 11px Inter;color:${C.text};background:rgba(255,255,255,.05);border:1px solid ${C.line};padding:3px 8px;border-radius:999px}
+  .chip.out{color:${C.muted};text-decoration:line-through;opacity:.6}
+  .owntag{font:700 9px Inter;letter-spacing:.5px;text-transform:uppercase}
+  table.lt,table.grp{width:100%;border-collapse:collapse;font:600 12px Inter;color:${C.muted}}
+  table.lt th,table.grp th{font:700 10px Inter;letter-spacing:.5px;text-transform:uppercase;color:${C.muted};padding:10px 5px;text-align:center;white-space:nowrap;border-bottom:1px solid ${C.line};user-select:none}
+  table.lt td,table.grp td{padding:9px 5px;text-align:center;border-bottom:1px solid rgba(255,255,255,.05)}
+  table.lt tr:last-child td,table.grp tr:last-child td{border-bottom:none}
+  th.sorted,td.sorted{color:${C.gold}}
+  .rankdot{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;font:800 10px Inter;color:#0A0F1E;vertical-align:middle}
+  i.rankdot{width:11px;height:11px;margin-right:4px}
+  .inp{width:100%;background:#0E1626;border:1px solid ${C.line};color:${C.text};font:600 13px Inter;padding:9px 10px;border-radius:10px;outline:none}
+  .inp:focus{border-color:${C.gold}}
+  .lbl{display:block;font:700 9px Inter;letter-spacing:.5px;text-transform:uppercase;color:${C.muted};margin-bottom:4px}
+  .score{width:38px;text-align:center;background:#0E1626;border:1px solid ${C.line};color:${C.text};font:700 14px Inter;padding:6px 2px;border-radius:8px;outline:none}
+  .score:focus{border-color:${C.gold}}
+  .btn{background:${C.gold};color:#0A0F1E;border:none;font:800 13px Inter;padding:10px 16px;border-radius:10px;cursor:pointer}
+  .btn:hover{background:#ffd76b} .btn:disabled{opacity:.5;cursor:default}
+  .xbtn{background:transparent;border:1px solid ${C.line};color:${C.muted};font:700 12px Inter;padding:6px 10px;border-radius:8px;cursor:pointer}
+  .xbtn:hover{color:${C.red};border-color:${C.red}} .xbtn:disabled{opacity:.5}
+  .overlay{position:fixed;inset:0;background:rgba(5,8,16,.7);display:flex;align-items:center;justify-content:center;z-index:50;backdrop-filter:blur(3px)}
+  input[type=number]::-webkit-inner-spin-button{opacity:.3}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+`}</style>; }
+
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>

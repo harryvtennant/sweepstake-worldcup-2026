@@ -110,15 +110,50 @@ function groupFixtures(L){ const t=GROUPS[L]; const pr=[[0,1],[2,3],[0,2],[1,3],
 const FIXTURES={}; GROUP_LETTERS.forEach(L=>FIXTURES[L]=groupFixtures(L));
 const FIXTURE_INDEX={}; GROUP_LETTERS.forEach(L=>FIXTURES[L].forEach(fx=>FIXTURE_INDEX[[fx.a,fx.b].sort().join("|")]={L,fx}));
 
-function computeStandings(L,results){
+function miniTable(names,results,L){
+  const m={}; names.forEach(n=>m[n]={pts:0,gd:0,gf:0});
+  FIXTURES[L].forEach(fx=>{ if(!m[fx.a]||!m[fx.b])return; const r=results[fx.id]; if(!r||r.hs==null)return;
+    m[fx.a].gf+=r.hs; m[fx.a].gd+=r.hs-r.as; m[fx.b].gf+=r.as; m[fx.b].gd+=r.as-r.hs;
+    if(r.hs>r.as)m[fx.a].pts+=3; else if(r.hs<r.as)m[fx.b].pts+=3; else {m[fx.a].pts++;m[fx.b].pts++;} });
+  return m;
+}
+function computeStandings(L,results,discipline,official){
   const teams=GROUPS[L]; const idx=Object.fromEntries(teams.map((t,k)=>[t,k]));
+  const disc=discipline||{};
   const st=teams.map(name=>({name,p:0,w:0,d:0,l:0,gf:0,ga:0}));
   FIXTURES[L].forEach(fx=>{const r=results[fx.id]; if(!r||r.hs==null||r.as==null)return;
     const A=st[idx[fx.a]],B=st[idx[fx.b]]; A.p++;B.p++;A.gf+=r.hs;A.ga+=r.as;B.gf+=r.as;B.ga+=r.hs;
     if(r.hs>r.as){A.w++;B.l++;}else if(r.hs<r.as){B.w++;A.l++;}else{A.d++;B.d++;}});
-  st.forEach(x=>{x.pts=x.w*3+x.d;x.gd=x.gf-x.ga;});
-  st.sort((a,b)=>b.pts-a.pts||b.gd-a.gd||b.gf-a.gf||strength(b.name)-strength(a.name)||a.name.localeCompare(b.name));
-  st.forEach((x,k)=>x.rank=k+1); return st;
+  st.forEach(x=>{x.pts=x.w*3+x.d;x.gd=x.gf-x.ga;x.fp=disc[x.name]||0;});
+
+  // Prefer the official table (ESPN already applies FIFA's tiebreakers server-side) when every
+  // team in this group is present in it; otherwise fall back to our own calc below.
+  if(official && teams.every(t=>official[t])){
+    st.forEach(x=>{ const o=official[x.name];
+      x.rank=o.rank; x.pts=o.pts; x.p=o.p||x.p; x.w=o.w||x.w; x.d=o.d||x.d; x.l=o.l||x.l;
+      x.gf=o.gf||x.gf; x.ga=o.ga||x.ga; x.gd=x.gf-x.ga; });
+    st.sort((a,b)=>a.rank-b.rank);
+    return st;
+  }
+
+  // FIFA 2026 ranking (local fallback): 1) points 2) goal difference 3) goals scored, then for
+  // teams still level: 4) head-to-head points 5) h2h goal difference 6) h2h goals 7) fair-play 8) lots
+  st.sort((a,b)=>b.pts-a.pts||b.gd-a.gd||b.gf-a.gf);
+  const out=[]; let i=0;
+  while(i<st.length){
+    let j=i+1; while(j<st.length && st[j].pts===st[i].pts && st[j].gd===st[i].gd && st[j].gf===st[i].gf) j++;
+    const tied=st.slice(i,j);
+    if(tied.length>1){
+      const mini=miniTable(tied.map(t=>t.name),results,L);
+      tied.sort((a,b)=>{ const ma=mini[a.name],mb=mini[b.name];
+        return (mb.pts-ma.pts)||(mb.gd-ma.gd)||(mb.gf-ma.gf)
+          ||((disc[b.name]||0)-(disc[a.name]||0))          // fair play: fewer cards (less negative) ranks higher
+          ||(strength(b.name)-strength(a.name))             // drawing of lots — deterministic seeding proxy
+          ||a.name.localeCompare(b.name); });
+    }
+    out.push(...tied); i=j;
+  }
+  out.forEach((x,k)=>x.rank=k+1); return out;
 }
 const groupDone=(L,r)=>FIXTURES[L].every(fx=>r[fx.id]&&r[fx.id].hs!=null);
 function koWL(m){ if(m.hs==null||m.as==null)return null; if(m.hs>m.as)return{w:m.a,l:m.b}; if(m.hs<m.as)return{w:m.b,l:m.a};
@@ -129,7 +164,7 @@ const STATE_KEY="wc26x:state:v1", CONFIG_KEY="wc26x:config:v1";
 const SEED_RESULTS={ "A-02":{hs:2,as:0,src:"auto"},"A-13":{hs:2,as:1,src:"auto"},
   "B-03":{hs:1,as:1,src:"auto"},"B-12":{hs:1,as:1,src:"auto"},"E-03":{hs:7,as:1,src:"auto"},"F-01":{hs:2,as:2,src:"auto"} };
 const DEFAULT_STATE={ groupResults:SEED_RESULTS, ko:[], awards:{champion:null},
-  scorers:[], keepers:[], autoScorers:[], odds:{}, lastSync:null, syncError:null };
+  scorers:[], keepers:[], autoScorers:[], discipline:{}, officialStandings:null, odds:{}, lastSync:null, syncError:null };
 const hasStore = typeof window!=="undefined" && window.storage;
 
 /* ============================================================ */
@@ -274,24 +309,74 @@ async function fetchESPN(){
   const events=[], seen=new Set();
   ok.forEach(s=>(s.value.events||[]).forEach(ev=>{ if(ev.id&&!seen.has(ev.id)){ seen.add(ev.id); events.push(ev); } }));
   if(!events.length) throw new Error("ESPN returned nothing");
-  const results=[], scorerMap={};
+  const results=[], scorerMap={}, disc={};
   events.forEach(ev=>{ const comp=ev.competitions?.[0]; if(!comp) return;
     const cs=comp.competitors||[]; const home=cs.find(c=>c.homeAway==="home")||cs[0]; const away=cs.find(c=>c.homeAway==="away")||cs[1]; if(!home||!away) return;
     const a=resolveTeam(home.team), b=resolveTeam(away.team); if(!a||!b) return;
     if(!(comp.status?.type?.completed ?? (comp.status?.type?.state==="post"))) return;
     const ga=parseInt(home.score,10), gb=parseInt(away.score,10); if(!Number.isFinite(ga)||!Number.isFinite(gb)) return;
-    results.push({stage:espnStage(ev,comp,a,b),a,b,ga,gb,pa:numOrNull(home.shootoutScore),pb:numOrNull(away.shootoutScore)});
+    const stage=espnStage(ev,comp,a,b);
+    results.push({stage,a,b,ga,gb,pa:numOrNull(home.shootoutScore),pb:numOrNull(away.shootoutScore)});
     (comp.details||[]).forEach(d=>{ const tx=(d?.type?.text||"").toLowerCase();
-      if(d.scoringPlay && !/own goal/.test(tx)){ const nm=d.athletesInvolved?.[0]?.displayName; if(!nm) return;
-        const tm=d.team?.id===home.team?.id?a:b; const k=nm+"|"+tm; (scorerMap[k]=scorerMap[k]||{p:nm,t:tm,g:0}).g++; } });
+      const tm=d.team?.id===home.team?.id?a:b;
+      if(d.scoringPlay && !/own goal/.test(tx)){ const nm=d.athletesInvolved?.[0]?.displayName; if(nm){ const k=nm+"|"+tm; (scorerMap[k]=scorerMap[k]||{p:nm,t:tm,g:0}).g++; } }
+      // FIFA fair-play points (group stage only): yellow -1, second yellow -2 (-3 total), direct red -4
+      if(stage==="group"){
+        if(/yellow.?red|second yellow/.test(tx)) disc[tm]=(disc[tm]||0)-2;
+        else if(/red card/.test(tx)) disc[tm]=(disc[tm]||0)-4;
+        else if(/yellow/.test(tx)) disc[tm]=(disc[tm]||0)-1;
+      }
+    });
   });
   const scorers=Object.values(scorerMap).filter(s=>OWNER_OF[s.t]).sort((x,y)=>y.g-x.g).slice(0,15);
-  return { results, scorers };
+  return { results, scorers, discipline: disc };
+}
+
+/* ---- ESPN's own official standings table — already FIFA-tiebreaker-correct server-side, so we mirror it
+   rather than re-deriving rank ourselves. Falls back gracefully if unavailable. ---- */
+function statVal(entry,...names){
+  const stats=entry?.stats||[];
+  for(const want of names){
+    const hit=stats.find(s=>{ const n=(s.name||s.abbreviation||s.shortDisplayName||"").toLowerCase(); return n===want.toLowerCase(); });
+    if(hit){ const v=hit.value!=null?hit.value:parseFloat(hit.displayValue); if(Number.isFinite(v)) return v; }
+  }
+  return null;
+}
+async function fetchESPNStandings(){
+  const urls=[
+    "https://site.api.espn.com/apis/v2/sports/soccer/fifa.world/standings",
+    "https://site.web.api.espn.com/apis/v2/sports/soccer/fifa.world/standings",
+  ];
+  let data=null, lastErr=null;
+  for(const u of urls){ try{ const r=await fetch(u); if(!r.ok) throw new Error("HTTP "+r.status); data=await r.json(); if(data) break; }catch(e){ lastErr=e; } }
+  if(!data) throw new Error("standings unreachable — "+(lastErr?lastErr.message:"no response"));
+  // groups live under data.children (one per World Cup group); each has standings.entries
+  const groups=data.children||data.standings?.[0]?.children||[];
+  if(!groups.length) throw new Error("standings: no groups in response");
+  const table={}; // teamName -> {rank,pts,p,w,d,l,gf,ga,gd}
+  groups.forEach(g=>{
+    const entries=g.standings?.entries||[]; const ranked=[];
+    entries.forEach(e=>{ const name=resolveTeam(e.team); if(!name) return;
+      const pts=statVal(e,"points","pts"), p=statVal(e,"gamesplayed","played","gp"),
+        w=statVal(e,"wins","w"), d=statVal(e,"ties","draws","d"), l=statVal(e,"losses","l"),
+        gf=statVal(e,"pointsfor","goalsfor","gf"), ga=statVal(e,"pointsagainst","goalsagainst","ga"),
+        rank=(e.note&&Number.isFinite(e.note.rank)?e.note.rank:null) ?? statVal(e,"rank") ?? null;
+      ranked.push({name, pts:pts??0, p:p??0, w:w??0, d:d??0, l:l??0, gf:gf??0, ga:ga??0, rank});
+    });
+    // if ESPN doesn't expose an explicit rank stat, entries are already returned in their official order
+    ranked.forEach((r,i)=>{ table[r.name]={ ...r, rank:r.rank??(i+1) }; });
+  });
+  if(!Object.keys(table).length) throw new Error("standings: no teams parsed");
+  return table;
 }
 async function fetchLive(){
-  try{ return await fetchESPN(); }                  // primary: complete + accurate on a normal page
-  catch(eE){ try{ return await fetchSearch(); }     // fallback: web search (used inside the Claude sandbox)
+  let core;
+  try{ core = await fetchESPN(); }                  // primary: complete + accurate on a normal page
+  catch(eE){ try{ core = await fetchSearch(); }     // fallback: web search (used inside the Claude sandbox)
     catch(eS){ throw new Error(`sync failed — ${eE.message}`); } }
+  let officialStandings=null;
+  try{ officialStandings = await fetchESPNStandings(); }catch(e){ /* non-fatal: Groups tab falls back to our own table */ }
+  return { ...core, officialStandings };
 }
 
 function mergeLive(prev,p){
@@ -313,18 +398,20 @@ function mergeLive(prev,p){
   });
   next.groupResults=gr; next.ko=ko;
   next.autoScorers=(p.scorers||[]).filter(s=>OWNER_OF[s.t]).slice(0,20);
+  next.discipline=p.discipline||{};
+  if(p.officialStandings) next.officialStandings=p.officialStandings;
   next.lastSync=new Date().toISOString(); next.syncError=null;
   return next;
 }
 
 /* ============================================================ ANALYSIS ============================================================ */
 function analyse(state){
-  const results=state.groupResults||{}, ko=state.ko||[], odds=state.odds||{};
+  const results=state.groupResults||{}, ko=state.ko||[], odds=state.odds||{}, discipline=state.discipline||{}, official=state.officialStandings||null;
   const standings={},complete={},rankOf={};
-  GROUP_LETTERS.forEach(L=>{ standings[L]=computeStandings(L,results); complete[L]=groupDone(L,results); standings[L].forEach(s=>rankOf[s.name]=s.rank); });
+  GROUP_LETTERS.forEach(L=>{ standings[L]=computeStandings(L,results,discipline,official); complete[L]=groupDone(L,results); standings[L].forEach(s=>rankOf[s.name]=s.rank); });
   const allComplete=GROUP_LETTERS.every(L=>complete[L]);
   let thirdAdv=new Set();
-  if(allComplete){ const th=GROUP_LETTERS.map(L=>standings[L][2]); th.sort((a,b)=>b.pts-a.pts||b.gd-a.gd||b.gf-a.gf||strength(b.name)-strength(a.name)); th.slice(0,8).forEach(t=>thirdAdv.add(t.name)); }
+  if(allComplete){ const th=GROUP_LETTERS.map(L=>standings[L][2]); th.sort((a,b)=>b.pts-a.pts||b.gd-a.gd||b.gf-a.gf||((discipline[b.name]||0)-(discipline[a.name]||0))||strength(b.name)-strength(a.name)); th.slice(0,8).forEach(t=>thirdAdv.add(t.name)); }
 
   const koLosers=new Set(); const koStats={}; ALL_TEAMS.forEach(t=>koStats[t]={p:0,w:0,d:0,l:0,gf:0,ga:0});
   const clashes=[];
@@ -366,6 +453,8 @@ function analyse(state){
     if(r==="a"){A.w++;B.l++;}else if(r==="b"){B.w++;A.l++;}else{A.d++;B.d++;}});
   OWNERS.forEach(o=>{const H=h2h[o];H.gd=H.gf-H.ga;H.pts=H.w*3+H.d;});
   const h2hRanked=[...OWNERS].map(o=>h2h[o]).sort((a,b)=>b.pts-a.pts||b.gd-a.gd||b.gf-a.gf||b.w-a.w);
+  const h2hPlayed=h2hRanked.some(o=>o.p>0);
+  const loser = h2hPlayed ? h2hRanked[h2hRanked.length-1] : null;   // Absolute Loser = bottom of the head-to-head table
 
   // golden boot: auto + manual scorers
   const scMap=new Map();
@@ -380,7 +469,8 @@ function analyse(state){
   const keeperName={}; (state.keepers||[]).forEach(k=>{if(OWNER_OF[k.t])keeperName[k.t]=k.p;});
   const cleanSheets=ALL_TEAMS.map(t=>({t,owner:OWNER_OF[t],cs:cs[t],keeper:keeperName[t]||null})).filter(x=>x.cs>0).sort((a,b)=>b.cs-a.cs||strength(b.t)-strength(a.t)).slice(0,15);
 
-  return { standings,complete,allComplete,teamOut,owner,ownerRanked,champion,h2hRanked,
+  return { standings,complete,allComplete,teamOut,owner,ownerRanked,champion,h2hRanked,loser,h2hPlayed,
+    usingOfficial: !!official,
     clashes:clashes.slice().reverse(), scorers, cleanSheets, bootLeader:scorers[0]||null, gloveLeader:cleanSheets[0]||null };
 }
 
@@ -466,6 +556,9 @@ function ClashSide({team,owner,score,pen,lose}){
 function GroupsView({A}){
   return (
     <div style={{paddingTop:14,display:"grid",gap:14}}>
+      <p style={{font:"500 12px/1.5 Inter",color:C.muted,margin:"0 2px 4px"}}>
+        {A.usingOfficial?"Group order mirrors ESPN's official standings, including FIFA's tiebreaker rules.":"Group order uses FIFA's tiebreaker rules locally — confirms against ESPN's official table on the next successful sync."}
+      </p>
       {GROUP_LETTERS.map(L=>{const st=A.standings[L];
         return (
           <div key={L} className="card" style={{padding:"12px 12px 6px"}}>
@@ -520,6 +613,17 @@ function AwardsView({A}){
           {champO&&<div style={{marginLeft:"auto",textAlign:"right"}}><div style={{display:"flex",alignItems:"center",gap:6,justifyContent:"flex-end"}}><Crest owner={champO} size={22}/><b className="display" style={{fontSize:18,color:C.text}}>{champO}</b></div><div style={{font:"600 11px Inter",color:C.muted}}>{champ}</div></div>}
         </div>
         {!champO && <div style={{marginTop:8,font:"500 12px Inter",color:C.muted}}>Crowned automatically once the Final is played.</div>}
+        <Prize value="£80"/>
+      </div>
+
+      <div className="card" style={{padding:14}}>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <span style={{fontSize:22}}>💀</span>
+          <div><div className="display" style={{fontSize:17,color:C.red}}>Absolute Loser</div><div style={{font:"500 11px Inter",color:C.muted}}>Bottom of the head-to-head table</div></div>
+          {A.loser&&<div style={{marginLeft:"auto",textAlign:"right"}}><div style={{display:"flex",alignItems:"center",gap:6,justifyContent:"flex-end"}}><Crest owner={A.loser.owner} size={22}/><b className="display" style={{fontSize:18,color:C.text}}>{A.loser.owner}</b></div><div style={{font:"600 11px Inter",color:C.muted}}>{A.champion?"confirmed":"currently last"}</div></div>}
+        </div>
+        {!A.loser && <div style={{marginTop:8,font:"500 12px Inter",color:C.muted}}>Decided at the end — whoever finishes bottom of the head-to-head table.</div>}
+        <Prize value="Next gathering — family servant & owes a bottle!" forfeit/>
       </div>
 
       <div className="card" style={{padding:14}}>
@@ -532,6 +636,12 @@ function AwardsView({A}){
       </div>
     </div>
   );
+}
+function Prize({value,forfeit}){
+  return (<div style={{display:"flex",alignItems:"center",gap:8,marginTop:10,paddingTop:10,borderTop:`1px solid ${C.line}`}}>
+    <span style={{font:"800 9px Inter",letterSpacing:".5px",textTransform:"uppercase",padding:"3px 8px",borderRadius:6,whiteSpace:"nowrap",background:forfeit?"rgba(251,107,91,.16)":"rgba(244,201,93,.16)",color:forfeit?C.red:C.gold}}>{forfeit?"Forfeit":"Prize"}</span>
+    <span style={{font:"600 12px Inter",color:C.text}}>{value}</span>
+  </div>);
 }
 
 function ScorerBoard({A}){
@@ -548,6 +658,7 @@ function ScorerBoard({A}){
           <span className="owntag" style={{color:OWNER_COLOR[OWNER_OF[s.t]]}}>{OWNER_OF[s.t]}</span>
           <span className="display" style={{marginLeft:"auto",fontSize:18,color:C.text}}>{s.g}</span>
         </div>))}</div>
+      <Prize value="£10"/>
     </div>
   );
 }
@@ -564,6 +675,7 @@ function GloveBoard({A}){
           <span className="owntag" style={{color:OWNER_COLOR[s.owner]}}>{s.owner}</span>
           <span className="display" style={{marginLeft:"auto",fontSize:18,color:C.text}}>{s.cs}</span>
         </div>))}</div>
+      <Prize value="£10"/>
     </div>
   );
 }

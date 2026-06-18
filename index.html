@@ -164,7 +164,8 @@ const STATE_KEY="wc26x:state:v1", CONFIG_KEY="wc26x:config:v1";
 const SEED_RESULTS={ "A-02":{hs:2,as:0,src:"auto"},"A-13":{hs:2,as:1,src:"auto"},
   "B-03":{hs:1,as:1,src:"auto"},"B-12":{hs:1,as:1,src:"auto"},"E-03":{hs:7,as:1,src:"auto"},"F-01":{hs:2,as:2,src:"auto"} };
 const DEFAULT_STATE={ groupResults:SEED_RESULTS, ko:[], awards:{champion:null},
-  scorers:[], keepers:[], autoScorers:[], discipline:{}, officialStandings:null, odds:{}, lastSync:null, syncError:null };
+  scorers:[], keepers:[], autoScorers:[], discipline:{}, officialStandings:null,
+  upcoming:[], resultDates:{}, odds:{}, lastSync:null, syncError:null };
 const hasStore = typeof window!=="undefined" && window.storage;
 
 /* ============================================================ */
@@ -206,7 +207,7 @@ function App(){
   const standing=OWNERS.filter(o=>!A.owner[o].out).length;
   const teamsLeft=ALL_TEAMS.filter(t=>!A.teamOut[t]).length;
   const leader=A.ownerRanked[0];
-  const TABS=[["leaderboard","Leaderboard"],["h2h","Head-to-head"],["groups","Groups"],["knockouts","Knockouts"],["awards","Awards & stats"]];
+  const TABS=[["leaderboard","Leaderboard"],["h2h","H2H"],["groups","Groups"],["knockouts","Knockouts"],["awards","Awards"]];
 
   return (
     <Shell>
@@ -309,18 +310,25 @@ async function fetchESPN(){
   const events=[], seen=new Set();
   ok.forEach(s=>(s.value.events||[]).forEach(ev=>{ if(ev.id&&!seen.has(ev.id)){ seen.add(ev.id); events.push(ev); } }));
   if(!events.length) throw new Error("ESPN returned nothing");
-  const results=[], scorerMap={}, disc={};
+  const results=[], scorerMap={}, disc={}, upcoming=[];
+  const now=Date.now();
   events.forEach(ev=>{ const comp=ev.competitions?.[0]; if(!comp) return;
     const cs=comp.competitors||[]; const home=cs.find(c=>c.homeAway==="home")||cs[0]; const away=cs.find(c=>c.homeAway==="away")||cs[1]; if(!home||!away) return;
     const a=resolveTeam(home.team), b=resolveTeam(away.team); if(!a||!b) return;
-    if(!(comp.status?.type?.completed ?? (comp.status?.type?.state==="post"))) return;
+    const completed=comp.status?.type?.completed ?? (comp.status?.type?.state==="post");
+    const evDate=ev.date||null; // ISO string e.g. "2026-06-12T19:00Z"
+    if(!completed){
+      // upcoming: only future matches involving sweepstake teams
+      const koISO=evDate; const koMs=koISO?Date.parse(koISO):null;
+      if(OWNER_OF[a]&&OWNER_OF[b]) upcoming.push({stage:espnStage(ev,comp,a,b),a,b,ko:koISO,koMs:koMs||0});
+      return;
+    }
     const ga=parseInt(home.score,10), gb=parseInt(away.score,10); if(!Number.isFinite(ga)||!Number.isFinite(gb)) return;
     const stage=espnStage(ev,comp,a,b);
-    results.push({stage,a,b,ga,gb,pa:numOrNull(home.shootoutScore),pb:numOrNull(away.shootoutScore)});
+    results.push({stage,a,b,ga,gb,pa:numOrNull(home.shootoutScore),pb:numOrNull(away.shootoutScore),date:evDate});
     (comp.details||[]).forEach(d=>{ const tx=(d?.type?.text||"").toLowerCase();
       const tm=d.team?.id===home.team?.id?a:b;
       if(d.scoringPlay && !/own goal/.test(tx)){ const nm=d.athletesInvolved?.[0]?.displayName; if(nm){ const k=nm+"|"+tm; (scorerMap[k]=scorerMap[k]||{p:nm,t:tm,g:0}).g++; } }
-      // FIFA fair-play points (group stage only): yellow -1, second yellow -2 (-3 total), direct red -4
       if(stage==="group"){
         if(/yellow.?red|second yellow/.test(tx)) disc[tm]=(disc[tm]||0)-2;
         else if(/red card/.test(tx)) disc[tm]=(disc[tm]||0)-4;
@@ -328,8 +336,9 @@ async function fetchESPN(){
       }
     });
   });
+  upcoming.sort((a,b)=>a.koMs-b.koMs);
   const scorers=Object.values(scorerMap).filter(s=>OWNER_OF[s.t]).sort((x,y)=>y.g-x.g).slice(0,15);
-  return { results, scorers, discipline: disc };
+  return { results, scorers, discipline: disc, upcoming: upcoming.slice(0,40) };
 }
 
 /* ---- ESPN's own official standings table — already FIFA-tiebreaker-correct server-side, so we mirror it
@@ -400,6 +409,11 @@ function mergeLive(prev,p){
   next.autoScorers=(p.scorers||[]).filter(s=>OWNER_OF[s.t]).slice(0,20);
   next.discipline=p.discipline||{};
   if(p.officialStandings) next.officialStandings=p.officialStandings;
+  if(p.upcoming) next.upcoming=p.upcoming;
+  // Store result dates: merge into a date map {fixtureKey -> ISO}
+  const rdates={...prev.resultDates||{}};
+  (p.results||[]).forEach(m=>{ if(m.date&&m.a&&m.b) rdates[[m.a,m.b].sort().join("|")]=m.date; });
+  next.resultDates=rdates;
   next.lastSync=new Date().toISOString(); next.syncError=null;
   return next;
 }
@@ -407,6 +421,7 @@ function mergeLive(prev,p){
 /* ============================================================ ANALYSIS ============================================================ */
 function analyse(state){
   const results=state.groupResults||{}, ko=state.ko||[], odds=state.odds||{}, discipline=state.discipline||{}, official=state.officialStandings||null;
+  const rdates=state.resultDates||{}, upcoming=state.upcoming||[];
   const standings={},complete={},rankOf={};
   GROUP_LETTERS.forEach(L=>{ standings[L]=computeStandings(L,results,discipline,official); complete[L]=groupDone(L,results); standings[L].forEach(s=>rankOf[s.name]=s.rank); });
   const allComplete=GROUP_LETTERS.every(L=>complete[L]);
@@ -415,11 +430,12 @@ function analyse(state){
 
   const koLosers=new Set(); const koStats={}; ALL_TEAMS.forEach(t=>koStats[t]={p:0,w:0,d:0,l:0,gf:0,ga:0});
   const clashes=[];
-  const add=(stage,a,b,ga,gb,pens)=>clashes.push({stage,a,b,ga,gb,pens,oa:OWNER_OF[a],ob:OWNER_OF[b]});
-  GROUP_LETTERS.forEach(L=>FIXTURES[L].forEach(fx=>{const r=results[fx.id]; if(r&&r.hs!=null) add("Group "+L,fx.a,fx.b,r.hs,r.as,null);}));
+  const getDate=(a,b)=>rdates[[a,b].sort().join("|")]||null;
+  const add=(stage,a,b,ga,gb,pens,date)=>clashes.push({stage,a,b,ga,gb,pens,oa:OWNER_OF[a],ob:OWNER_OF[b],date});
+  GROUP_LETTERS.forEach(L=>FIXTURES[L].forEach(fx=>{const r=results[fx.id]; if(r&&r.hs!=null) add("Group "+L,fx.a,fx.b,r.hs,r.as,null,getDate(fx.a,fx.b));}));
   ko.forEach(m=>{ if(m.hs==null||m.as==null) return; const SA=koStats[m.a],SB=koStats[m.b];
     if(SA&&SB){SA.p++;SB.p++;SA.gf+=m.hs;SA.ga+=m.as;SB.gf+=m.as;SB.ga+=m.hs; if(m.hs>m.as){SA.w++;SB.l++;}else if(m.hs<m.as){SB.w++;SA.l++;}else{SA.d++;SB.d++;}}
-    const wl=koWL(m); if(wl) koLosers.add(wl.l); add(m.round,m.a,m.b,m.hs,m.as,(m.pa!=null&&m.pb!=null)?[m.pa,m.pb]:null); });
+    const wl=koWL(m); if(wl) koLosers.add(wl.l); add(m.round,m.a,m.b,m.hs,m.as,(m.pa!=null&&m.pb!=null)?[m.pa,m.pb]:null,getDate(m.a,m.b)); });
 
   const teamOut={};
   ALL_TEAMS.forEach(t=>{ if(koLosers.has(t)){teamOut[t]=true;return;} const L=GROUP_OF[t];
@@ -470,7 +486,7 @@ function analyse(state){
   const cleanSheets=ALL_TEAMS.map(t=>({t,owner:OWNER_OF[t],cs:cs[t],keeper:keeperName[t]||null})).filter(x=>x.cs>0).sort((a,b)=>b.cs-a.cs||strength(b.t)-strength(a.t)).slice(0,15);
 
   return { standings,complete,allComplete,teamOut,owner,ownerRanked,champion,h2hRanked,loser,h2hPlayed,
-    usingOfficial: !!official,
+    usingOfficial: !!official, upcoming,
     clashes:clashes.slice().reverse(), scorers, cleanSheets, bootLeader:scorers[0]||null, gloveLeader:cleanSheets[0]||null };
 }
 
@@ -518,10 +534,44 @@ function Leaderboard({A}){
   );
 }
 
+function fmtMatchDate(iso){
+  if(!iso) return null;
+  try{ return new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/London",weekday:"short",day:"numeric",month:"short",hour:"2-digit",minute:"2-digit",hour12:false}).format(new Date(iso))+" (UK)"; }
+  catch(e){ return null; }
+}
+
+// Clash sort: by real date (desc) if available, else by stage-order proxy
+const STAGE_ORDER = {"Final":100,"Third place":90,"Semi-final":80,"Quarter-final":70,"Round of 16":60,"Round of 32":50};
+function clashOrder(c){
+  if(c.date) return Date.parse(c.date);
+  if(STAGE_ORDER[c.stage]) return STAGE_ORDER[c.stage]*1e11;
+  const m=c.stage.match(/Group ([A-L])/); if(!m) return 0;
+  return GROUP_LETTERS.indexOf(m[1])*3e10+1e10;
+}
+
 function HeadToHead({A}){
+  const [filterOwner,setFilterOwner]=useState("");
+  const [filterTeam,setFilterTeam]=useState("");
+
+  const sorted=[...A.clashes].sort((a,b)=>clashOrder(b)-clashOrder(a));
+  const visible=sorted.filter(c=>{
+    if(filterOwner && c.oa!==filterOwner && c.ob!==filterOwner) return false;
+    if(filterTeam && c.a!==filterTeam && c.b!==filterTeam) return false;
+    return true;
+  });
+  const nowMs=Date.now();
+  const upFilt=(A.upcoming||[]).filter(u=>{
+    if(!u.a||!u.b||!OWNER_OF[u.a]||!OWNER_OF[u.b]) return false;
+    if(filterOwner) return OWNER_OF[u.a]===filterOwner||OWNER_OF[u.b]===filterOwner;
+    if(filterTeam) return u.a===filterTeam||u.b===filterTeam;
+    return true;
+  }).filter(u=>u.koMs>nowMs);
+  let nextFx=[];
+  if(upFilt.length){ const e=upFilt[0].koMs; nextFx=upFilt.filter(u=>u.koMs-e<60000); }
+
   return (
     <div style={{paddingTop:14}}>
-      <p style={{font:"500 12px/1.5 Inter",color:C.muted,margin:"0 2px 12px"}}>Every match where two of the pooled teams meet. Cross-player clashes go on each player's record; when a player's own two teams meet, both results count for them — one win and one loss. A knockout settled on penalties counts as a draw.</p>
+      <p style={{font:"500 12px/1.5 Inter",color:C.muted,margin:"0 2px 12px"}}>Every match where two of the pooled teams meet. Cross-player clashes go on each player's record; when a player's own two teams meet, both results count for them. A knockout settled on penalties counts as a draw.</p>
       <div style={{overflowX:"auto",border:`1px solid ${C.line}`,borderRadius:14,marginBottom:16}}>
         <table className="lt"><thead><tr><th style={{textAlign:"left",paddingLeft:14}}>Player</th><th>P</th><th>W</th><th>D</th><th>L</th><th>GF</th><th>GA</th><th>GD</th><th className="sorted">Pts</th></tr></thead>
           <tbody>{A.h2hRanked.map(O=>(
@@ -529,20 +579,68 @@ function HeadToHead({A}){
               <td>{O.p}</td><td>{O.w}</td><td>{O.d}</td><td>{O.l}</td><td>{O.gf}</td><td>{O.ga}</td><td>{O.gd>=0?"+":""}{O.gd}</td><td className="sorted"><b style={{color:C.text}}>{O.pts}</b></td></tr>))}</tbody>
         </table>
       </div>
-      <div className="display" style={{fontSize:15,color:C.gold,margin:"4px 2px 8px"}}>The clashes</div>
+
+      <div className="display" style={{fontSize:15,color:C.gold,margin:"4px 2px 10px"}}>The clashes</div>
+
+      {/* Filters */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+        <div>
+          <label className="lbl">Filter by player</label>
+          <select className="inp" value={filterOwner} onChange={e=>{setFilterOwner(e.target.value);setFilterTeam("");}}>
+            <option value="">All players</option>
+            {OWNERS.map(o=><option key={o} value={o}>{o}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="lbl">Filter by team</label>
+          <select className="inp" value={filterTeam} onChange={e=>{setFilterTeam(e.target.value);setFilterOwner("");}}>
+            <option value="">All teams</option>
+            {GROUP_LETTERS.map(L=><optgroup key={L} label={`Group ${L}`}>{GROUPS[L].map(t=><option key={t} value={t}>{t}</option>)}</optgroup>)}
+          </select>
+        </div>
+      </div>
+      {nextFx.length>0 && (
+        <div className="card" style={{padding:"10px 12px",marginBottom:12,borderColor:"rgba(244,201,93,.3)"}}>
+          <div style={{font:"700 9px Inter",letterSpacing:"1px",color:C.gold,textTransform:"uppercase",marginBottom:6}}>
+            {`Next match${nextFx.length>1?"es":""}${filterOwner?` · ${filterOwner}`:filterTeam?` · ${filterTeam}`:""}`}
+            {nextFx[0].ko&&<span style={{fontWeight:500,color:C.muted,marginLeft:8,textTransform:"none"}}>{fmtMatchDate(nextFx[0].ko)}</span>}
+          </div>
+          {nextFx.map((u,i)=>(
+            <div key={i}>
+              {i>0&&<div style={{height:1,background:C.line,margin:"4px 0"}}/>}
+              <div style={{display:"flex",alignItems:"center",gap:6,padding:"4px 0"}}>
+                <span style={{font:"600 12px Inter",color:C.text,flex:1,textAlign:"right"}}>{u.a}</span>
+                <span className="owntag" style={{color:OWNER_COLOR[OWNER_OF[u.a]]}}>{OWNER_OF[u.a]}</span>
+                <span style={{font:"800 11px Inter",color:C.muted,padding:"0 6px"}}>vs</span>
+                <span className="owntag" style={{color:OWNER_COLOR[OWNER_OF[u.b]]}}>{OWNER_OF[u.b]}</span>
+                <span style={{font:"600 12px Inter",color:C.text,flex:1}}>{u.b}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {(filterOwner||filterTeam)&&nextFx.length===0&&<div style={{font:"600 11px Inter",color:C.muted,marginBottom:10}}>No upcoming fixtures for this selection.</div>}
+      {(filterOwner||filterTeam)&&<div style={{font:"600 11px Inter",color:C.muted,marginBottom:10}}>Showing {visible.length} of {sorted.length} clashes</div>}
+
       {A.clashes.length===0 && <div className="card" style={{padding:18,textAlign:"center",color:C.muted,font:"500 13px Inter"}}>No two pooled teams have met yet.</div>}
-      <div style={{display:"grid",gap:8}}>{A.clashes.map((c,i)=>{
+      {A.clashes.length>0 && visible.length===0 && <div className="card" style={{padding:18,textAlign:"center",color:C.muted,font:"500 13px Inter"}}>No clashes match this filter.</div>}
+      <div style={{display:"grid",gap:8}}>{visible.map((c,i)=>{
         const same=c.oa===c.ob;
         const winTeam=c.ga>c.gb?c.a:c.ga<c.gb?c.b:(c.pens?(c.pens[0]>c.pens[1]?c.a:c.b):null);
         const winOwner=winTeam?OWNER_OF[winTeam]:null;
+        const dateLbl=fmtMatchDate(c.date);
         return (
           <div key={i} className="card" style={{padding:"10px 12px"}}>
-            <div style={{font:"700 9px Inter",letterSpacing:"1px",color:C.muted,textTransform:"uppercase",marginBottom:6}}>{c.stage}{same?" · same player":""}</div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:6,gap:6}}>
+              <span style={{font:"700 9px Inter",letterSpacing:"1px",color:C.muted,textTransform:"uppercase"}}>{c.stage}{same?" · same player":""}</span>
+              {dateLbl&&<span style={{font:"500 10px Inter",color:C.muted,whiteSpace:"nowrap"}}>{dateLbl}</span>}
+            </div>
             <ClashSide team={c.a} owner={c.oa} score={c.ga} pen={c.pens?c.pens[0]:null} lose={winTeam&&winTeam!==c.a}/>
             <div style={{height:1,background:C.line,margin:"2px 0"}}/>
             <ClashSide team={c.b} owner={c.ob} score={c.gb} pen={c.pens?c.pens[1]:null} lose={winTeam&&winTeam!==c.b}/>
             <div style={{font:"700 10px Inter",color:same?C.gold:(winOwner?OWNER_COLOR[winOwner]:C.muted),marginTop:6,textAlign:"right"}}>{same?`Both results count for ${c.oa}`:(winOwner?`${winOwner} wins the bragging rights`:"Honours even")}</div>
-          </div>);})}</div>
+          </div>);})}
+      </div>
     </div>
   );
 }
@@ -555,23 +653,45 @@ function ClashSide({team,owner,score,pen,lose}){
 
 function GroupsView({A}){
   return (
-    <div style={{paddingTop:14,display:"grid",gap:14}}>
-      <p style={{font:"500 12px/1.5 Inter",color:C.muted,margin:"0 2px 4px"}}>
-        {A.usingOfficial?"Group order mirrors ESPN's official standings, including FIFA's tiebreaker rules.":"Group order uses FIFA's tiebreaker rules locally — confirms against ESPN's official table on the next successful sync."}
+    <div style={{paddingTop:14,display:"grid",gap:12}}>
+      <p style={{font:"500 12px/1.5 Inter",color:C.muted,margin:"0 2px 2px"}}>
+        {A.usingOfficial?"Group order mirrors ESPN's official standings.":"Group order uses FIFA tiebreaker rules — syncs against ESPN's official table on next sync."}
       </p>
       {GROUP_LETTERS.map(L=>{const st=A.standings[L];
         return (
-          <div key={L} className="card" style={{padding:"12px 12px 6px"}}>
-            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}><span className="display" style={{fontSize:18,color:C.gold}}>Group {L}</span><span style={{font:"600 10px Inter",color:C.muted,letterSpacing:"1px",textTransform:"uppercase"}}>{A.complete[L]?"complete":"in progress"}</span></div>
-            <table className="grp"><thead><tr><th></th><th style={{textAlign:"left"}}>Team</th><th>P</th><th>W</th><th>D</th><th>L</th><th>GF</th><th>GA</th><th>GD</th><th>Pts</th></tr></thead>
-              <tbody>{st.map(s=>{const out=A.teamOut[s.name];
+          <div key={L} className="card" style={{padding:"12px 10px 6px"}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+              <span className="display" style={{fontSize:17,color:C.gold}}>Group {L}</span>
+              <span style={{font:"600 9px Inter",color:C.muted,letterSpacing:"1px",textTransform:"uppercase"}}>{A.complete[L]?"complete":"in progress"}</span>
+            </div>
+            <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,fontFamily:"Inter,sans-serif",color:C.muted}}>
+              <thead><tr>
+                <th style={{width:20,padding:"6px 4px 6px 2px"}}></th>
+                <th style={{textAlign:"left",padding:"6px 4px",fontWeight:700,fontSize:10,letterSpacing:".5px",textTransform:"uppercase",borderBottom:`1px solid ${C.line}`,color:C.muted,whiteSpace:"nowrap"}}>Team</th>
+                {["P","W","D","L","GF","GA","GD","Pts"].map(h=><th key={h} style={{textAlign:"center",padding:"6px 5px",fontWeight:700,fontSize:10,letterSpacing:".5px",textTransform:"uppercase",borderBottom:`1px solid ${C.line}`,color:C.muted,whiteSpace:"nowrap"}}>{h}</th>)}
+              </tr></thead>
+              <tbody>{st.map((s,ri)=>{const out=A.teamOut[s.name]; const last=ri===st.length-1;
                 return (<tr key={s.name} style={{opacity:out?.45:1}}>
-                  <td><span className="rankdot" style={{background:s.rank<=2?C.green:s.rank===3?(out?C.red:C.gold):C.red}}>{s.rank}</span></td>
-                  <td style={{textAlign:"left"}}><span style={{display:"inline-flex",alignItems:"center",gap:6}}><FlagDot team={s.name}/><span style={{color:C.text}}>{s.name}</span><span className="owntag" style={{color:OWNER_COLOR[OWNER_OF[s.name]]}}>{OWNER_OF[s.name]}</span></span></td>
-                  <td>{s.p}</td><td>{s.w}</td><td>{s.d}</td><td>{s.l}</td><td>{s.gf}</td><td>{s.ga}</td><td>{s.gd>=0?"+":""}{s.gd}</td><td><b style={{color:C.text}}>{s.pts}</b></td></tr>);})}</tbody>
+                  <td style={{padding:"7px 4px 7px 2px",borderBottom:last?"none":`1px solid rgba(255,255,255,.05)`,textAlign:"center"}}>
+                    <span className="rankdot" style={{background:s.rank<=2?C.green:s.rank===3?(out?C.red:C.gold):C.red}}>{s.rank}</span>
+                  </td>
+                  <td style={{textAlign:"left",padding:"7px 4px",borderBottom:last?"none":`1px solid rgba(255,255,255,.05)`,whiteSpace:"nowrap"}}>
+                    <span style={{display:"inline-flex",alignItems:"center",gap:5}}>
+                      <FlagDot team={s.name}/>
+                      <span style={{color:C.text,fontWeight:600}}>{s.name}</span>
+                      <span style={{font:"700 8px Inter",letterSpacing:".5px",textTransform:"uppercase",color:OWNER_COLOR[OWNER_OF[s.name]]}}>{OWNER_OF[s.name]}</span>
+                    </span>
+                  </td>
+                  {[s.p,s.w,s.d,s.l,s.gf,s.ga,(s.gd>=0?"+":"")+s.gd].map((v,ci)=>(
+                    <td key={ci} style={{textAlign:"center",padding:"7px 5px",borderBottom:last?"none":`1px solid rgba(255,255,255,.05)`}}>{v}</td>
+                  ))}
+                  <td style={{textAlign:"center",padding:"7px 5px",borderBottom:last?"none":`1px solid rgba(255,255,255,.05)`}}><b style={{color:C.text}}>{s.pts}</b></td>
+                </tr>);})}</tbody>
             </table>
+            </div>
           </div>);})}
-      <div style={{display:"flex",gap:14,flexWrap:"wrap",font:"600 11px Inter",color:C.muted,padding:"2px 4px"}}>
+      <div style={{display:"flex",gap:12,flexWrap:"wrap",font:"600 11px Inter",color:C.muted,padding:"2px 4px"}}>
         <span><i className="rankdot" style={{background:C.green}}/> Top 2 — through</span><span><i className="rankdot" style={{background:C.gold}}/> 3rd — best 8 go through</span><span><i className="rankdot" style={{background:C.red}}/> Out</span>
       </div>
     </div>
@@ -703,9 +823,8 @@ function Style(){ return <style>{`
   .display{font-family:'Barlow Condensed',Inter,sans-serif;font-weight:800;text-transform:uppercase}
   .card{background:${C.panel};border:1px solid ${C.line};border-radius:16px}
   .statcard{padding:12px 14px}
-  .tabs{display:flex;gap:6px;overflow-x:auto;padding:14px 14px 6px;scrollbar-width:none}
-  .tabs::-webkit-scrollbar{display:none}
-  .tab{flex:0 0 auto;background:transparent;border:1px solid ${C.line};color:${C.muted};font:700 12px Inter;padding:8px 14px;border-radius:999px;cursor:pointer;white-space:nowrap;transition:.15s}
+  .tabs{display:flex;gap:5px;padding:14px 14px 6px}
+  .tab{flex:1 1 0;min-width:0;background:transparent;border:1px solid ${C.line};color:${C.muted};font:700 11px Inter;padding:9px 4px;border-radius:10px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:center;transition:.15s}
   .tab:hover{color:${C.text}} .tab.active{background:${C.gold};border-color:${C.gold};color:#0A0F1E}
   .lockbtn{background:transparent;border:1px solid ${C.line};color:${C.gold};font:700 12px Inter;padding:8px 14px;border-radius:999px;cursor:pointer;white-space:nowrap}
   .lockbtn:hover{border-color:${C.gold}}

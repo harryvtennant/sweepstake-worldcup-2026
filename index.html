@@ -448,6 +448,16 @@ function mergeLive(prev,p){
 }
 
 /* ============================================================ ANALYSIS ============================================================ */
+// Given a ranked list (already sorted desc by value) and accessors for value + owning player,
+// returns the unique players who share the single top value — i.e. a genuine tie at #1.
+function tiedWinners(list, valueOf, ownerOf){
+  if(!list.length) return [];
+  const top=valueOf(list[0]);
+  const owners=new Set();
+  list.forEach(item=>{ if(valueOf(item)===top){ const o=ownerOf(item); if(o) owners.add(o); } });
+  return [...owners];
+}
+
 function analyse(state){
   const results=state.groupResults||{}, ko=state.ko||[], odds=state.odds||{}, discipline=state.discipline||{}, official=state.officialStandings||null;
   const rdates=state.resultDates||{}, upcoming=state.upcoming||[], live=(state.live||[]).filter(m=>OWNER_OF[m.a]&&OWNER_OF[m.b]);
@@ -516,7 +526,9 @@ function analyse(state){
 
   return { standings,complete,allComplete,teamOut,owner,ownerRanked,champion,h2hRanked,loser,h2hPlayed,
     usingOfficial: !!official, upcoming, live,
-    clashes:clashes.slice().reverse(), scorers, cleanSheets, bootLeader:scorers[0]||null, gloveLeader:cleanSheets[0]||null };
+    clashes:clashes.slice().reverse(), scorers, cleanSheets, bootLeader:scorers[0]||null, gloveLeader:cleanSheets[0]||null,
+    bootWinners: tiedWinners(scorers, s=>s.g, s=>OWNER_OF[s.t]),
+    gloveWinners: tiedWinners(cleanSheets, s=>s.cs, s=>s.owner) };
 }
 
 /* ============================================================ VIEWS ============================================================ */
@@ -814,53 +826,74 @@ function AwardsView({A}){
     </div>
   );
 }
-function Prize({value,forfeit}){
-  return (<div style={{display:"flex",alignItems:"center",gap:8,marginTop:10,paddingTop:10,borderTop:`1px solid ${C.line}`}}>
+function Prize({value,forfeit,splitCount}){
+  const showSplit = splitCount && splitCount>1;
+  const m = showSplit ? value.match(/^£(\d+(?:\.\d+)?)$/) : null;
+  const splitLabel = m ? `£${(parseFloat(m[1])/splitCount).toFixed(2).replace(/\.00$/,"")} each` : null;
+  return (<div style={{display:"flex",alignItems:"center",gap:8,marginTop:10,paddingTop:10,borderTop:`1px solid ${C.line}`,flexWrap:"wrap"}}>
     <span style={{font:"800 9px Inter",letterSpacing:".5px",textTransform:"uppercase",padding:"3px 8px",borderRadius:6,whiteSpace:"nowrap",background:forfeit?"rgba(251,107,91,.16)":"rgba(244,201,93,.16)",color:forfeit?C.red:C.gold}}>{forfeit?"Forfeit":"Prize"}</span>
     <span style={{font:"600 12px Inter",color:C.text}}>{value}</span>
+    {showSplit && <span style={{font:"600 11px Inter",color:C.gold}}>split {splitCount} ways{splitLabel?` — ${splitLabel}`:""}</span>}
   </div>);
 }
 
 function ScorerBoard({A}){
-  const list=A.scorers, leader=A.bootLeader;
+  const list=A.scorers, winners=A.bootWinners||[];
+  const topVal=list.length?list[0].g:0;
   return (
     <div className="card" style={{padding:14}}>
-      <BoardHead emoji="⚽" title="Golden Boot" sub="Top scorers — most goals" holder={leader?OWNER_OF[leader.t]:null}/>
+      <BoardHead emoji="⚽" title="Golden Boot" sub="Top scorers — most goals" holders={winners}/>
       {list.length===0 && <div style={{font:"500 12px Inter",color:C.muted}}>No goals recorded yet — these appear after the next sync.</div>}
-      <div style={{display:"grid",gap:2}}>{list.map((s,i)=>(
+      <div style={{display:"grid",gap:2}}>{list.map((s,i)=>{
+        const tied=s.g===topVal;
+        return (
         <div key={s.p+s.t} style={{display:"flex",alignItems:"center",gap:9,padding:"6px 0",borderTop:i?"1px solid rgba(255,255,255,.05)":"none"}}>
-          <span className="display" style={{width:18,textAlign:"center",fontSize:15,color:i===0?C.gold:C.muted}}>{i+1}</span>
+          <span className="display" style={{width:18,textAlign:"center",fontSize:15,color:tied?C.gold:C.muted}}>{i+1}</span>
           <span style={{font:"600 13px Inter",color:C.text}}>{s.p}</span>
           <span style={{display:"inline-flex",alignItems:"center",gap:5}}><FlagDot team={s.t}/><span style={{font:"500 11px Inter",color:C.muted}}>{s.t}</span></span>
           <span className="owntag" style={{color:OWNER_COLOR[OWNER_OF[s.t]]}}>{OWNER_OF[s.t]}</span>
-          <span className="display" style={{marginLeft:"auto",fontSize:18,color:C.text}}>{s.g}</span>
-        </div>))}</div>
-      <Prize value="£10"/>
+          <span className="display" style={{marginLeft:"auto",fontSize:18,color:tied?C.gold:C.text}}>{s.g}</span>
+        </div>);})}</div>
+      <Prize value="£10" splitCount={winners.length}/>
     </div>
   );
 }
 function GloveBoard({A}){
-  const list=A.cleanSheets, leader=A.gloveLeader;
+  const list=A.cleanSheets, winners=A.gloveWinners||[];
+  const topVal=list.length?list[0].cs:0;
   return (
     <div className="card" style={{padding:14}}>
-      <BoardHead emoji="🧤" title="Golden Glove" sub="Most clean sheets (by team)" holder={leader?leader.owner:null}/>
+      <BoardHead emoji="🧤" title="Golden Glove" sub="Most clean sheets (by team)" holders={winners}/>
       {list.length===0 && <div style={{font:"500 12px Inter",color:C.muted}}>No clean sheets yet.</div>}
-      <div style={{display:"grid",gap:2}}>{list.map((s,i)=>(
+      <div style={{display:"grid",gap:2}}>{list.map((s,i)=>{
+        const tied=s.cs===topVal;
+        return (
         <div key={s.t} style={{display:"flex",alignItems:"center",gap:9,padding:"6px 0",borderTop:i?"1px solid rgba(255,255,255,.05)":"none"}}>
-          <span className="display" style={{width:18,textAlign:"center",fontSize:15,color:i===0?C.gold:C.muted}}>{i+1}</span>
+          <span className="display" style={{width:18,textAlign:"center",fontSize:15,color:tied?C.gold:C.muted}}>{i+1}</span>
           <span style={{display:"inline-flex",alignItems:"center",gap:6}}><FlagDot team={s.t}/><span style={{font:"600 13px Inter",color:C.text}}>{s.t}</span></span>
           <span className="owntag" style={{color:OWNER_COLOR[s.owner]}}>{s.owner}</span>
-          <span className="display" style={{marginLeft:"auto",fontSize:18,color:C.text}}>{s.cs}</span>
-        </div>))}</div>
-      <Prize value="£10"/>
+          <span className="display" style={{marginLeft:"auto",fontSize:18,color:tied?C.gold:C.text}}>{s.cs}</span>
+        </div>);})}</div>
+      <Prize value="£10" splitCount={winners.length}/>
     </div>
   );
 }
-function BoardHead({emoji,title,sub,holder}){
-  return (<div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+function BoardHead({emoji,title,sub,holders}){
+  const list=holders||[];
+  return (<div style={{display:"flex",alignItems:"flex-start",gap:10,marginBottom:10}}>
     <span style={{fontSize:22}}>{emoji}</span>
     <div><div className="display" style={{fontSize:17,color:C.gold}}>{title}</div><div style={{font:"500 11px Inter",color:C.muted}}>{sub}</div></div>
-    {holder&&<div style={{marginLeft:"auto",textAlign:"right"}}><div style={{display:"flex",alignItems:"center",gap:6,justifyContent:"flex-end"}}><Crest owner={holder} size={20}/><b className="display" style={{fontSize:16,color:C.text}}>{holder}</b></div><div style={{font:"600 10px Inter",color:C.muted}}>holds it</div></div>}
+    {list.length>0 &&
+      <div style={{marginLeft:"auto",textAlign:"right"}}>
+        <div style={{display:"flex",flexWrap:"wrap",gap:6,justifyContent:"flex-end",maxWidth:180}}>
+          {list.map(o=>(
+            <div key={o} style={{display:"flex",alignItems:"center",gap:5}}>
+              <Crest owner={o} size={20}/><b className="display" style={{fontSize:15,color:C.text}}>{o}</b>
+            </div>
+          ))}
+        </div>
+        <div style={{font:"600 10px Inter",color:C.muted,marginTop:2}}>{list.length>1?"sharing it":"holds it"}</div>
+      </div>}
   </div>);
 }
 

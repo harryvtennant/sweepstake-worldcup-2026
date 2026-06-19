@@ -53,12 +53,12 @@ const OWNER_OF = {
   "Haiti":"Nan","Norway":"Nan","Morocco":"Nan","Spain":"Nan","Belgium":"Nan",
   "DR Congo":"Ruby","Tunisia":"Ruby","Iraq":"Ruby","Algeria":"Ruby","Scotland":"Ruby",
   "Canada":"Dad","Portugal":"Dad","Czechia":"Dad","South Korea":"Dad","Jordan":"Dad",
-  "Curaçao":"George","Bosnia & Herzegovina":"George","Brazil":"George","Cape Verde":"George","Germany":"George",
+  "Curaçao":"George","Bosnia":"George","Brazil":"George","Cape Verde":"George","Germany":"George",
   "Iran":"Harriette","Netherlands":"Harriette","England":"Harriette","South Africa":"Harriette",
 };
 const GROUPS = {
   A:["Mexico","South Korea","South Africa","Czechia"],
-  B:["Canada","Switzerland","Qatar","Bosnia & Herzegovina"],
+  B:["Canada","Switzerland","Qatar","Bosnia"],
   C:["Brazil","Morocco","Scotland","Haiti"],
   D:["United States","Australia","Paraguay","Turkey"],
   E:["Germany","Ecuador","Ivory Coast","Curaçao"],
@@ -81,7 +81,7 @@ const BASE_ODDS = {
   "Colombia":51,"Mexico":51,"Senegal":51,"Switzerland":67,"Japan":67,"Sweden":67,
   "Ecuador":81,"Austria":81,"Turkey":81,"Canada":81,"Ivory Coast":101,"Egypt":126,
   "South Korea":151,"Australia":151,"Czechia":151,"Scotland":201,"Algeria":201,"Ghana":201,
-  "Qatar":251,"Tunisia":251,"Iran":251,"Paraguay":251,"Bosnia & Herzegovina":251,"DR Congo":251,
+  "Qatar":251,"Tunisia":251,"Iran":251,"Paraguay":251,"Bosnia":251,"DR Congo":251,
   "Saudi Arabia":501,"Uzbekistan":501,"South Africa":501,"Jordan":751,"Iraq":751,"Panama":751,
   "Cape Verde":751,"New Zealand":1001,"Haiti":1001,"Curaçao":1001,
 };
@@ -98,7 +98,7 @@ const ALIAS = {
   "côte d'ivoire":"Ivory Coast","cote d'ivoire":"Ivory Coast","ivory coast":"Ivory Coast",
   "curacao":"Curaçao","curaçao":"Curaçao","cabo verde":"Cape Verde","cape verde":"Cape Verde",
   "dr congo":"DR Congo","congo dr":"DR Congo","democratic republic of the congo":"DR Congo","congo democratic republic":"DR Congo",
-  "bosnia":"Bosnia & Herzegovina","bosnia and herzegovina":"Bosnia & Herzegovina","bosnia & herzegovina":"Bosnia & Herzegovina","bosnia-herzegovina":"Bosnia & Herzegovina",
+  "bosnia":"Bosnia","bosnia and herzegovina":"Bosnia","bosnia & herzegovina":"Bosnia","bosnia-herzegovina":"Bosnia",
   "ir iran":"Iran","iran":"Iran","saudi arabia":"Saudi Arabia",
 };
 function normTeam(n){ if(!n) return null; const k=String(n).trim().toLowerCase();
@@ -165,7 +165,7 @@ const SEED_RESULTS={ "A-02":{hs:2,as:0,src:"auto"},"A-13":{hs:2,as:1,src:"auto"}
   "B-03":{hs:1,as:1,src:"auto"},"B-12":{hs:1,as:1,src:"auto"},"E-03":{hs:7,as:1,src:"auto"},"F-01":{hs:2,as:2,src:"auto"} };
 const DEFAULT_STATE={ groupResults:SEED_RESULTS, ko:[], awards:{champion:null},
   scorers:[], keepers:[], autoScorers:[], discipline:{}, officialStandings:null,
-  upcoming:[], resultDates:{}, odds:{}, lastSync:null, syncError:null };
+  upcoming:[], live:[], resultDates:{}, odds:{}, lastSync:null, syncError:null };
 const hasStore = typeof window!=="undefined" && window.storage;
 
 /* ============================================================ */
@@ -174,6 +174,7 @@ function App(){
   const [loaded,setLoaded]=useState(false);
   const [tab,setTab]=useState("leaderboard");
   const [syncing,setSyncing]=useState(false);
+  const syncingRef=useRef(false);
   const stateRef=useRef(state);
   stateRef.current=state;
 
@@ -187,19 +188,28 @@ function App(){
   const persistNow=useCallback(async(next)=>{ setState(next); if(hasStore){try{await window.storage.set(STATE_KEY,JSON.stringify(next),true);}catch(e){}} },[]);
 
   const doSync=useCallback(async()=>{
-    setSyncing(true);
+    setSyncing(true); syncingRef.current=true;
     try{
       const payload=await fetchLive();
       let base=stateRef.current;
       if(hasStore){try{const r=await window.storage.get(STATE_KEY,true); if(r?.value) base={...DEFAULT_STATE,...JSON.parse(r.value)};}catch(e){}}
       await persistNow(mergeLive(base,payload));
     }catch(e){ setState({...stateRef.current,syncError:String(e.message||e)}); }
-    finally{ setSyncing(false); }
+    finally{ setSyncing(false); syncingRef.current=false; }
   },[persistNow]);
 
-  // One fresh pull when the page opens; after that, only the "Sync now" button refreshes.
+  // One fresh pull when the page opens; after that, only the "Sync now" button refreshes —
+  // EXCEPT while a match is actually live, where we poll quietly every 60s so the Golden
+  // Boot (and live scores) stay current without re-fetching constantly when nothing's on.
   const didSync=useRef(false);
   useEffect(()=>{ if(!loaded||didSync.current) return; didSync.current=true; doSync(); },[loaded,doSync]);
+
+  const isLive = (state.live||[]).length>0;
+  useEffect(()=>{
+    if(!isLive) return; // efficiency: no background timer at all when nothing's live
+    const id=setInterval(()=>{ if(!syncingRef.current) doSync(); }, 60000);
+    return ()=>clearInterval(id);
+  },[isLive,doSync]);
 
   const A=useMemo(()=>analyse(state),[state]);
   if(!loaded) return <Shell><Style/><div style={{padding:"90px 20px",textAlign:"center",color:C.muted}}>Loading the sweepstake…</div></Shell>;
@@ -207,7 +217,7 @@ function App(){
   const standing=OWNERS.filter(o=>!A.owner[o].out).length;
   const teamsLeft=ALL_TEAMS.filter(t=>!A.teamOut[t]).length;
   const leader=A.ownerRanked[0];
-  const TABS=[["leaderboard","Leaderboard"],["h2h","H2H"],["groups","Groups"],["knockouts","Knockouts"],["awards","Awards"]];
+  const TABS=[["leaderboard","Odds"],["h2h","H2H"],["groups","Groups"],["knockouts","KO"],["awards","Awards"]];
 
   return (
     <Shell>
@@ -215,7 +225,7 @@ function App(){
       <div style={{padding:"22px 18px 6px"}}>
         <div>
           <div style={{font:"800 11px/1 Inter",letterSpacing:"3px",color:C.gold,textTransform:"uppercase",marginBottom:8}}>Canada · México · USA 2026</div>
-          <h1 className="display" style={{margin:0,fontSize:34,lineHeight:.95,letterSpacing:"-.5px",color:C.text}}>The World Cup<br/>Sweepstake</h1>
+          <h1 className="display" style={{margin:0,fontSize:30,lineHeight:1,letterSpacing:"-.5px",color:C.text,whiteSpace:"nowrap"}}>World Cup Sweepstake</h1>
         </div>
         <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:18}}>
           <Stat big={standing} unit={`of ${OWNERS.length}`} label="players still standing"/>
@@ -310,13 +320,31 @@ async function fetchESPN(){
   const events=[], seen=new Set();
   ok.forEach(s=>(s.value.events||[]).forEach(ev=>{ if(ev.id&&!seen.has(ev.id)){ seen.add(ev.id); events.push(ev); } }));
   if(!events.length) throw new Error("ESPN returned nothing");
-  const results=[], scorerMap={}, disc={}, upcoming=[];
+  const results=[], scorerMap={}, disc={}, upcoming=[], live=[];
   const now=Date.now();
   events.forEach(ev=>{ const comp=ev.competitions?.[0]; if(!comp) return;
     const cs=comp.competitors||[]; const home=cs.find(c=>c.homeAway==="home")||cs[0]; const away=cs.find(c=>c.homeAway==="away")||cs[1]; if(!home||!away) return;
     const a=resolveTeam(home.team), b=resolveTeam(away.team); if(!a||!b) return;
-    const completed=comp.status?.type?.completed ?? (comp.status?.type?.state==="post");
+    const stType=comp.status?.type?.state; // "pre" | "in" | "post"
+    const completed=comp.status?.type?.completed ?? (stType==="post");
     const evDate=ev.date||null; // ISO string e.g. "2026-06-12T19:00Z"
+    if(stType==="in"){
+      if(OWNER_OF[a]&&OWNER_OF[b]){
+        const ga=parseInt(home.score,10), gb=parseInt(away.score,10);
+        live.push({stage:espnStage(ev,comp,a,b),a,b,
+          ga:Number.isFinite(ga)?ga:0, gb:Number.isFinite(gb)?gb:0,
+          clock:comp.status?.displayClock||null, period:comp.status?.period||null,
+          detail:comp.status?.type?.shortDetail||comp.status?.type?.detail||null});
+        // Capture goals as they happen in live matches too, so Golden Boot updates mid-game.
+        (comp.details||[]).forEach(d=>{ const tx=(d?.type?.text||"").toLowerCase();
+          if(d.scoringPlay && !/own goal/.test(tx)){ const nm=d.athletesInvolved?.[0]?.displayName; if(nm){
+            const tm=d.team?.id===home.team?.id?a:b; const k=nm+"|"+tm;
+            (scorerMap[k]=scorerMap[k]||{p:nm,t:tm,g:0}).g++;
+          } }
+        });
+      }
+      return;
+    }
     if(!completed){
       // upcoming: only future matches involving sweepstake teams
       const koISO=evDate; const koMs=koISO?Date.parse(koISO):null;
@@ -338,7 +366,7 @@ async function fetchESPN(){
   });
   upcoming.sort((a,b)=>a.koMs-b.koMs);
   const scorers=Object.values(scorerMap).filter(s=>OWNER_OF[s.t]).sort((x,y)=>y.g-x.g).slice(0,15);
-  return { results, scorers, discipline: disc, upcoming: upcoming.slice(0,40) };
+  return { results, scorers, discipline: disc, upcoming: upcoming.slice(0,40), live };
 }
 
 /* ---- ESPN's own official standings table — already FIFA-tiebreaker-correct server-side, so we mirror it
@@ -410,6 +438,7 @@ function mergeLive(prev,p){
   next.discipline=p.discipline||{};
   if(p.officialStandings) next.officialStandings=p.officialStandings;
   if(p.upcoming) next.upcoming=p.upcoming;
+  next.live=p.live||[]; // always fresh — live state is transient, never "locked"
   // Store result dates: merge into a date map {fixtureKey -> ISO}
   const rdates={...prev.resultDates||{}};
   (p.results||[]).forEach(m=>{ if(m.date&&m.a&&m.b) rdates[[m.a,m.b].sort().join("|")]=m.date; });
@@ -421,7 +450,7 @@ function mergeLive(prev,p){
 /* ============================================================ ANALYSIS ============================================================ */
 function analyse(state){
   const results=state.groupResults||{}, ko=state.ko||[], odds=state.odds||{}, discipline=state.discipline||{}, official=state.officialStandings||null;
-  const rdates=state.resultDates||{}, upcoming=state.upcoming||[];
+  const rdates=state.resultDates||{}, upcoming=state.upcoming||[], live=(state.live||[]).filter(m=>OWNER_OF[m.a]&&OWNER_OF[m.b]);
   const standings={},complete={},rankOf={};
   GROUP_LETTERS.forEach(L=>{ standings[L]=computeStandings(L,results,discipline,official); complete[L]=groupDone(L,results); standings[L].forEach(s=>rankOf[s.name]=s.rank); });
   const allComplete=GROUP_LETTERS.every(L=>complete[L]);
@@ -486,19 +515,20 @@ function analyse(state){
   const cleanSheets=ALL_TEAMS.map(t=>({t,owner:OWNER_OF[t],cs:cs[t],keeper:keeperName[t]||null})).filter(x=>x.cs>0).sort((a,b)=>b.cs-a.cs||strength(b.t)-strength(a.t)).slice(0,15);
 
   return { standings,complete,allComplete,teamOut,owner,ownerRanked,champion,h2hRanked,loser,h2hPlayed,
-    usingOfficial: !!official, upcoming,
+    usingOfficial: !!official, upcoming, live,
     clashes:clashes.slice().reverse(), scorers, cleanSheets, bootLeader:scorers[0]||null, gloveLeader:cleanSheets[0]||null };
 }
 
 /* ============================================================ VIEWS ============================================================ */
 function SyncBar({state,syncing,onSync}){
   const last=state.lastSync?timeAgo(state.lastSync):"never";
-  const dot=syncing?C.gold:(state.syncError?C.red:C.green);
+  const isLive=(state.live||[]).length>0;
+  const dot=syncing?C.gold:(state.syncError?C.red:(isLive?C.green:C.green));
   return (
     <div style={{display:"flex",alignItems:"center",gap:10,marginTop:14,padding:"9px 12px",border:`1px solid ${C.line}`,borderRadius:12,background:"rgba(255,255,255,.02)"}}>
-      <span style={{width:8,height:8,borderRadius:"50%",background:dot,boxShadow:syncing?`0 0 8px ${C.gold}`:"none"}}/>
+      <span style={{width:8,height:8,borderRadius:"50%",background:dot,boxShadow:(syncing||isLive)?`0 0 8px ${dot}`:"none"}}/>
       <span style={{font:"600 11px Inter",color:C.muted,minWidth:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-        {syncing?"Syncing latest results…":state.syncError?`Sync failed — ${state.syncError}`:`Updated ${last}`}
+        {syncing?"Syncing latest results…":state.syncError?`Sync failed — ${state.syncError}`:`Updated ${last}${isLive?" · live updates on":""}`}
       </span>
       <button className="xbtn" style={{marginLeft:"auto",padding:"5px 12px"}} onClick={onSync} disabled={syncing}>Sync now</button>
     </div>
@@ -569,6 +599,12 @@ function HeadToHead({A}){
   let nextFx=[];
   if(upFilt.length){ const e=upFilt[0].koMs; nextFx=upFilt.filter(u=>u.koMs-e<60000); }
 
+  const liveFilt=(A.live||[]).filter(m=>{
+    if(filterOwner) return OWNER_OF[m.a]===filterOwner||OWNER_OF[m.b]===filterOwner;
+    if(filterTeam) return m.a===filterTeam||m.b===filterTeam;
+    return true;
+  });
+
   return (
     <div style={{paddingTop:14}}>
       <p style={{font:"500 12px/1.5 Inter",color:C.muted,margin:"0 2px 12px"}}>Every match where two of the pooled teams meet. Cross-player clashes go on each player's record; when a player's own two teams meet, both results count for them. A knockout settled on penalties counts as a draw.</p>
@@ -588,7 +624,7 @@ function HeadToHead({A}){
           <label className="lbl">Filter by player</label>
           <select className="inp" value={filterOwner} onChange={e=>{setFilterOwner(e.target.value);setFilterTeam("");}}>
             <option value="">All players</option>
-            {OWNERS.map(o=><option key={o} value={o}>{o}</option>)}
+            {[...OWNERS].sort().map(o=><option key={o} value={o}>{o}</option>)}
           </select>
         </div>
         <div>
@@ -599,6 +635,22 @@ function HeadToHead({A}){
           </select>
         </div>
       </div>
+      {liveFilt.length>0 && (
+        <div className="card" style={{padding:"10px 12px",marginBottom:12,borderColor:"rgba(63,215,139,.35)"}}>
+          <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}>
+            <span style={{width:7,height:7,borderRadius:"50%",background:C.green,boxShadow:`0 0 6px ${C.green}`}}/>
+            <span style={{font:"700 9px Inter",letterSpacing:"1px",color:C.green,textTransform:"uppercase"}}>Live now{filterOwner?` · ${filterOwner}`:filterTeam?` · ${filterTeam}`:""}</span>
+          </div>
+          {liveFilt.map((m,i)=>(
+            <div key={i}>
+              {i>0&&<div style={{height:1,background:C.line,margin:"6px 0"}}/>}
+              <div style={{font:"600 9px Inter",color:C.muted,marginBottom:3}}>{m.stage}{m.detail?` · ${m.detail}`:m.clock?` · ${m.clock}`:""}</div>
+              <ClashSide team={m.a} owner={OWNER_OF[m.a]} score={m.ga} pen={null} lose={false}/>
+              <ClashSide team={m.b} owner={OWNER_OF[m.b]} score={m.gb} pen={null} lose={false}/>
+            </div>
+          ))}
+        </div>
+      )}
       {nextFx.length>0 && (
         <div className="card" style={{padding:"10px 12px",marginBottom:12,borderColor:"rgba(244,201,93,.3)"}}>
           <div style={{font:"700 9px Inter",letterSpacing:"1px",color:C.gold,textTransform:"uppercase",marginBottom:6}}>
@@ -659,37 +711,42 @@ function GroupsView({A}){
       </p>
       {GROUP_LETTERS.map(L=>{const st=A.standings[L];
         return (
-          <div key={L} className="card" style={{padding:"12px 10px 6px"}}>
-            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
-              <span className="display" style={{fontSize:17,color:C.gold}}>Group {L}</span>
+          <div key={L} className="card" style={{padding:"10px 6px 4px"}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6,padding:"0 6px"}}>
+              <span className="display" style={{fontSize:16,color:C.gold}}>Group {L}</span>
               <span style={{font:"600 9px Inter",color:C.muted,letterSpacing:"1px",textTransform:"uppercase"}}>{A.complete[L]?"complete":"in progress"}</span>
             </div>
-            <div style={{overflowX:"auto"}}>
-            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,fontFamily:"Inter,sans-serif",color:C.muted}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:11,fontFamily:"Inter,sans-serif",color:C.muted,tableLayout:"fixed"}}>
+              <colgroup>
+                <col style={{width:"24px"}}/>
+                <col style={{width:"130px"}}/>
+                {Array.from({length:8}).map((_,i)=><col key={i} style={{width:"9.5%"}}/>)}
+              </colgroup>
               <thead><tr>
-                <th style={{width:20,padding:"6px 4px 6px 2px"}}></th>
-                <th style={{textAlign:"left",padding:"6px 4px",fontWeight:700,fontSize:10,letterSpacing:".5px",textTransform:"uppercase",borderBottom:`1px solid ${C.line}`,color:C.muted,whiteSpace:"nowrap"}}>Team</th>
-                {["P","W","D","L","GF","GA","GD","Pts"].map(h=><th key={h} style={{textAlign:"center",padding:"6px 5px",fontWeight:700,fontSize:10,letterSpacing:".5px",textTransform:"uppercase",borderBottom:`1px solid ${C.line}`,color:C.muted,whiteSpace:"nowrap"}}>{h}</th>)}
+                <th style={{padding:"4px 0"}}></th>
+                <th style={{textAlign:"left",padding:"4px 4px",fontWeight:700,fontSize:9,letterSpacing:".3px",textTransform:"uppercase",borderBottom:`1px solid ${C.line}`,color:C.muted}}>Team</th>
+                {["P","W","D","L","GF","GA","GD","Pts"].map(h=><th key={h} style={{textAlign:"center",padding:"4px 0",fontWeight:700,fontSize:9,letterSpacing:"0",textTransform:"uppercase",borderBottom:`1px solid ${C.line}`,color:C.muted}}>{h}</th>)}
               </tr></thead>
               <tbody>{st.map((s,ri)=>{const out=A.teamOut[s.name]; const last=ri===st.length-1;
                 return (<tr key={s.name} style={{opacity:out?.45:1}}>
-                  <td style={{padding:"7px 4px 7px 2px",borderBottom:last?"none":`1px solid rgba(255,255,255,.05)`,textAlign:"center"}}>
-                    <span className="rankdot" style={{background:s.rank<=2?C.green:s.rank===3?(out?C.red:C.gold):C.red}}>{s.rank}</span>
+                  <td style={{padding:"7px 0",borderBottom:last?"none":`1px solid rgba(255,255,255,.05)`,textAlign:"center"}}>
+                    <span className="rankdot" style={{background:s.rank<=2?C.green:s.rank===3?(out?C.red:C.gold):C.red,width:16,height:16,fontSize:8}}>{s.rank}</span>
                   </td>
-                  <td style={{textAlign:"left",padding:"7px 4px",borderBottom:last?"none":`1px solid rgba(255,255,255,.05)`,whiteSpace:"nowrap"}}>
-                    <span style={{display:"inline-flex",alignItems:"center",gap:5}}>
+                  <td style={{textAlign:"left",padding:"6px 4px",borderBottom:last?"none":`1px solid rgba(255,255,255,.05)`}}>
+                    <div style={{display:"flex",alignItems:"center",gap:7}}>
                       <FlagDot team={s.name}/>
-                      <span style={{color:C.text,fontWeight:600}}>{s.name}</span>
-                      <span style={{font:"700 8px Inter",letterSpacing:".5px",textTransform:"uppercase",color:OWNER_COLOR[OWNER_OF[s.name]]}}>{OWNER_OF[s.name]}</span>
-                    </span>
+                      <div>
+                        <div style={{color:C.text,fontWeight:600,fontSize:13,lineHeight:1.25,whiteSpace:"nowrap"}}>{s.name}</div>
+                        <div style={{font:"700 8px Inter",letterSpacing:".3px",textTransform:"uppercase",color:OWNER_COLOR[OWNER_OF[s.name]],lineHeight:1.2,whiteSpace:"nowrap"}}>{OWNER_OF[s.name]}</div>
+                      </div>
+                    </div>
                   </td>
                   {[s.p,s.w,s.d,s.l,s.gf,s.ga,(s.gd>=0?"+":"")+s.gd].map((v,ci)=>(
-                    <td key={ci} style={{textAlign:"center",padding:"7px 5px",borderBottom:last?"none":`1px solid rgba(255,255,255,.05)`}}>{v}</td>
+                    <td key={ci} style={{textAlign:"center",padding:"7px 0",fontSize:12,borderBottom:last?"none":`1px solid rgba(255,255,255,.05)`}}>{v}</td>
                   ))}
-                  <td style={{textAlign:"center",padding:"7px 5px",borderBottom:last?"none":`1px solid rgba(255,255,255,.05)`}}><b style={{color:C.text}}>{s.pts}</b></td>
+                  <td style={{textAlign:"center",padding:"7px 0",fontSize:12,borderBottom:last?"none":`1px solid rgba(255,255,255,.05)`}}><b style={{color:C.text}}>{s.pts}</b></td>
                 </tr>);})}</tbody>
             </table>
-            </div>
           </div>);})}
       <div style={{display:"flex",gap:12,flexWrap:"wrap",font:"600 11px Inter",color:C.muted,padding:"2px 4px"}}>
         <span><i className="rankdot" style={{background:C.green}}/> Top 2 — through</span><span><i className="rankdot" style={{background:C.gold}}/> 3rd — best 8 go through</span><span><i className="rankdot" style={{background:C.red}}/> Out</span>

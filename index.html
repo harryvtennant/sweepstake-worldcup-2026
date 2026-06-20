@@ -28,7 +28,6 @@ if(!window.storage){
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef, useCallback } = React;
 
-
 /* ============================================================
    WORLD CUP 2026 — FAMILY SWEEPSTAKE TRACKER  (v3)
    • Live sync via Anthropic web search (batched per group),
@@ -136,20 +135,38 @@ function computeStandings(L,results,discipline,official){
     return st;
   }
 
-  // FIFA 2026 ranking (local fallback): 1) points 2) goal difference 3) goals scored, then for
-  // teams still level: 4) head-to-head points 5) h2h goal difference 6) h2h goals 7) fair-play 8) lots
-  st.sort((a,b)=>b.pts-a.pts||b.gd-a.gd||b.gf-a.gf);
+  // FIFA World Cup 2026 tiebreaker order (Article 13 of the official regulations):
+  // Step 1 (applied to teams level on points): head-to-head points, then head-to-head
+  //         goal difference, then head-to-head goals scored — using ONLY the match(es)
+  //         played between the tied teams themselves.
+  // Step 2 (only for teams still level after Step 1): goal difference in ALL group
+  //         matches, then goals scored in ALL group matches, then fair-play, then
+  //         FIFA ranking (we use `strength` as a deterministic ranking proxy).
+  st.sort((a,b)=>b.pts-a.pts);
   const out=[]; let i=0;
   while(i<st.length){
-    let j=i+1; while(j<st.length && st[j].pts===st[i].pts && st[j].gd===st[i].gd && st[j].gf===st[i].gf) j++;
-    const tied=st.slice(i,j);
+    let j=i+1; while(j<st.length && st[j].pts===st[i].pts) j++;
+    let tied=st.slice(i,j);
     if(tied.length>1){
       const mini=miniTable(tied.map(t=>t.name),results,L);
+      // Step 1: head-to-head among just the tied teams
       tied.sort((a,b)=>{ const ma=mini[a.name],mb=mini[b.name];
-        return (mb.pts-ma.pts)||(mb.gd-ma.gd)||(mb.gf-ma.gf)
-          ||((disc[b.name]||0)-(disc[a.name]||0))          // fair play: fewer cards (less negative) ranks higher
-          ||(strength(b.name)-strength(a.name))             // drawing of lots — deterministic seeding proxy
-          ||a.name.localeCompare(b.name); });
+        return (mb.pts-ma.pts)||(mb.gd-ma.gd)||(mb.gf-ma.gf); });
+      // Anyone STILL level after Step 1 (head-to-head didn't separate them) drops to Step 2
+      const out2=[]; let k=0;
+      while(k<tied.length){
+        let m=k+1; const mk=mini[tied[k].name];
+        while(m<tied.length){ const mm=mini[tied[m].name]; if(mm.pts===mk.pts&&mm.gd===mk.gd&&mm.gf===mk.gf) m++; else break; }
+        let sub=tied.slice(k,m);
+        if(sub.length>1){
+          sub=[...sub].sort((a,b)=>(b.gd-a.gd)||(b.gf-a.gf)
+            ||((disc[b.name]||0)-(disc[a.name]||0))          // fair play: fewer cards (less negative) ranks higher
+            ||(strength(b.name)-strength(a.name))             // FIFA ranking — deterministic seeding proxy
+            ||a.name.localeCompare(b.name));
+        }
+        out2.push(...sub); k=m;
+      }
+      tied=out2;
     }
     out.push(...tied); i=j;
   }

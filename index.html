@@ -159,6 +159,44 @@ const groupDone=(L,r)=>FIXTURES[L].every(fx=>r[fx.id]&&r[fx.id].hs!=null);
 function koWL(m){ if(m.hs==null||m.as==null)return null; if(m.hs>m.as)return{w:m.a,l:m.b}; if(m.hs<m.as)return{w:m.b,l:m.a};
   if(m.pa!=null&&m.pb!=null&&m.pa!==m.pb)return m.pa>m.pb?{w:m.a,l:m.b}:{w:m.b,l:m.a}; return null; }
 
+// ---- Early mathematical elimination (group stage) ----------------------
+// A team should drop out the moment it's IMPOSSIBLE for them to finish top
+// 3 in their group, even while fixtures remain — not just once the group
+// is fully played. We brute-force every remaining fixture's outcome (home
+// win / draw / away win) and re-run the existing FIFA-tiebreaker-aware
+// computeStandings() for each resulting scenario. A team is only "out"
+// if EVERY scenario puts them at rank 4 — i.e. there's no possible run of
+// results, under the real tiebreaker chain (pts, GD, goals, head-to-head,
+// fair play, lots), that lets them survive.
+const remainingFixtures=(L,results)=>FIXTURES[L].filter(fx=>!(results[fx.id]&&results[fx.id].hs!=null&&results[fx.id].as!=null));
+function simulateGroupOutcomes(fixtures){
+  if(!fixtures.length) return [{}];
+  const outcomes=[{hs:2,as:0},{hs:0,as:0},{hs:0,as:2}];
+  let combos=[{}];
+  fixtures.forEach(fx=>{ const next=[]; combos.forEach(c=>outcomes.forEach(o=>next.push({...c,[fx.id]:o}))); combos=next; });
+  return combos;
+}
+// Returns the set of teams in group L that are guaranteed to finish 4th
+// no matter how the remaining fixtures go.
+function computeEarlyEliminations(L,results,discipline,official){
+  const remaining=remainingFixtures(L,results);
+  const scenarios=simulateGroupOutcomes(remaining);
+  const survives=new Set();
+  scenarios.forEach(scenario=>{
+    const simResults={...results,...scenario};
+    // Real ESPN official standings only reflect the actual current state —
+    // once we're simulating hypothetical future results, fall back to our
+    // own tiebreaker calc; only use official for the (single) scenario that
+    // matches the truly current, already-played results.
+    const useOfficial = remaining.length===0 ? official : null;
+    const st=computeStandings(L,simResults,discipline,useOfficial);
+    st.forEach(s=>{ if(s.rank<=3) survives.add(s.name); });
+  });
+  const out=new Set();
+  GROUPS[L].forEach(t=>{ if(!survives.has(t)) out.add(t); });
+  return out;
+}
+
 /* storage */
 const STATE_KEY="wc26x:state:v1", CONFIG_KEY="wc26x:config:v1";
 const SEED_RESULTS={ "A-02":{hs:2,as:0,src:"auto"},"A-13":{hs:2,as:1,src:"auto"},
@@ -466,6 +504,7 @@ function analyse(state){
   const allComplete=GROUP_LETTERS.every(L=>complete[L]);
   let thirdAdv=new Set();
   if(allComplete){ const th=GROUP_LETTERS.map(L=>standings[L][2]); th.sort((a,b)=>b.pts-a.pts||b.gd-a.gd||b.gf-a.gf||((discipline[b.name]||0)-(discipline[a.name]||0))||strength(b.name)-strength(a.name)); th.slice(0,8).forEach(t=>thirdAdv.add(t.name)); }
+  const earlyOutByGroup={}; GROUP_LETTERS.forEach(L=>{ earlyOutByGroup[L]=complete[L]?new Set():computeEarlyEliminations(L,results,discipline,official); });
 
   const koLosers=new Set(); const koStats={}; ALL_TEAMS.forEach(t=>koStats[t]={p:0,w:0,d:0,l:0,gf:0,ga:0});
   const clashes=[];
@@ -478,6 +517,7 @@ function analyse(state){
 
   const teamOut={};
   ALL_TEAMS.forEach(t=>{ if(koLosers.has(t)){teamOut[t]=true;return;} const L=GROUP_OF[t];
+    if(earlyOutByGroup[L].has(t)){teamOut[t]=true;return;}
     if(complete[L]){const r=rankOf[t]; if(r===4){teamOut[t]=true;return;} if(r===3){teamOut[t]=allComplete?!thirdAdv.has(t):false;return;}} teamOut[t]=false; });
 
   const groupStats={}; GROUP_LETTERS.forEach(L=>standings[L].forEach(s=>groupStats[s.name]=s));

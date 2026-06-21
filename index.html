@@ -219,7 +219,7 @@ const STATE_KEY="wc26x:state:v1", CONFIG_KEY="wc26x:config:v1";
 const SEED_RESULTS={ "A-02":{hs:2,as:0,src:"auto"},"A-13":{hs:2,as:1,src:"auto"},
   "B-03":{hs:1,as:1,src:"auto"},"B-12":{hs:1,as:1,src:"auto"},"E-03":{hs:7,as:1,src:"auto"},"F-01":{hs:2,as:2,src:"auto"} };
 const DEFAULT_STATE={ groupResults:SEED_RESULTS, ko:[], awards:{champion:null, goldenBoot:null},
-  scorers:[], keepers:[], autoScorers:[], discipline:{}, officialStandings:null,
+  discipline:{}, officialStandings:null, officialScorers:null,
   upcoming:[], live:[], resultDates:{}, odds:{}, lastSync:null, syncError:null };
 const hasStore = typeof window!=="undefined" && window.storage;
 
@@ -330,15 +330,14 @@ function groupPrompt(letters){
   return `Use web search to find FINISHED match results so far at the 2026 FIFA World Cup for ${lines}. Today is ${TODAY_STR}. Return ONLY a JSON array, no prose or markdown: [{"a":"Team","b":"Team","ga":0,"gb":0}]. Include only matches already completed (full time). Use exactly these team names. If none have finished, return [].`;
 }
 const KO_PROMPT=`Use web search to find FINISHED knockout-stage results at the 2026 FIFA World Cup (Round of 32 onward). Today is ${TODAY_STR}. Return ONLY a JSON array, no prose: [{"round":"Round of 32|Round of 16|Quarter-final|Semi-final|Third place|Final","a":"Team","b":"Team","ga":0,"gb":0,"pa":null,"pb":null}]. Only completed matches; pa/pb are penalty-shootout scores or null. Use exact country names. If none yet, return [].`;
-const SCORERS_PROMPT=`Use web search to find the current TOP GOALSCORERS at the 2026 FIFA World Cup. Today is ${TODAY_STR}. Return ONLY a JSON array, top 10 highest first, no prose: [{"p":"Player full name","t":"Team","g":0}]. Use exact country names. If unclear this early, return [].`;
 
 async function fetchSearch(){
   const groupBatches=[["A","B","C"],["D","E","F"],["G","H","I"],["J","K","L"]];
   const jobs=[ ...groupBatches.map(g=>({type:"group",prompt:groupPrompt(g)})),
-    {type:"ko",prompt:KO_PROMPT}, {type:"sc",prompt:SCORERS_PROMPT} ];
+    {type:"ko",prompt:KO_PROMPT} ];
   const settled=await Promise.allSettled(jobs.map(j=>aiSearchJSON(j.prompt)));
   if(!settled.some(s=>s.status==="fulfilled")) throw new Error("search unavailable");
-  const results=[], scorers=[];
+  const results=[];
   settled.forEach((s,i)=>{
     if(s.status!=="fulfilled") return; const arr=Array.isArray(s.value)?s.value:[]; const type=jobs[i].type;
     if(type==="group") arr.forEach(m=>{ const a=normTeam(m.a),b=normTeam(m.b);
@@ -347,9 +346,8 @@ async function fetchSearch(){
     else if(type==="ko") arr.forEach(m=>{ const a=normTeam(m.a),b=normTeam(m.b); const round=KO_ORDER.includes(m.round)?m.round:null;
       if(round&&OWNER_OF[a]&&OWNER_OF[b]&&m.ga!=null&&m.gb!=null&&Number.isFinite(+m.ga)&&Number.isFinite(+m.gb))
         results.push({stage:round,a,b,ga:+m.ga,gb:+m.gb,pa:m.pa==null?null:+m.pa,pb:m.pb==null?null:+m.pb}); });
-    else arr.forEach(x=>{ const t=normTeam(x.t); if(OWNER_OF[t]&&x.p&&x.g!=null&&Number.isFinite(+x.g)) scorers.push({p:String(x.p),t,g:+x.g}); });
   });
-  return { results, scorers: scorers.sort((a,b)=>b.g-a.g).slice(0,15) };
+  return { results };
 }
 
 /* ---- ESPN public feed: complete, every group, every match (works on a normal web page / GitHub Pages) ---- */
@@ -375,7 +373,7 @@ async function fetchESPN(){
   const events=[], seen=new Set();
   ok.forEach(s=>(s.value.events||[]).forEach(ev=>{ if(ev.id&&!seen.has(ev.id)){ seen.add(ev.id); events.push(ev); } }));
   if(!events.length) throw new Error("ESPN returned nothing");
-  const results=[], scorerMap={}, disc={}, upcoming=[], live=[];
+  const results=[], disc={}, upcoming=[], live=[];
   const now=Date.now();
   events.forEach(ev=>{ const comp=ev.competitions?.[0]; if(!comp) return;
     const cs=comp.competitors||[]; const home=cs.find(c=>c.homeAway==="home")||cs[0]; const away=cs.find(c=>c.homeAway==="away")||cs[1]; if(!home||!away) return;
@@ -390,13 +388,6 @@ async function fetchESPN(){
           ga:Number.isFinite(ga)?ga:0, gb:Number.isFinite(gb)?gb:0,
           clock:comp.status?.displayClock||null, period:comp.status?.period||null,
           detail:comp.status?.type?.shortDetail||comp.status?.type?.detail||null});
-        // Capture goals as they happen in live matches too, so Golden Boot updates mid-game.
-        (comp.details||[]).forEach(d=>{ const tx=(d?.type?.text||"").toLowerCase();
-          if(d.scoringPlay && !/own goal/.test(tx)){ const nm=d.athletesInvolved?.[0]?.displayName; if(nm){
-            const tm=d.team?.id===home.team?.id?a:b; const k=nm+"|"+tm;
-            (scorerMap[k]=scorerMap[k]||{p:nm,t:tm,g:0}).g++;
-          } }
-        });
       }
       return;
     }
@@ -411,7 +402,6 @@ async function fetchESPN(){
     results.push({stage,a,b,ga,gb,pa:numOrNull(home.shootoutScore),pb:numOrNull(away.shootoutScore),date:evDate});
     (comp.details||[]).forEach(d=>{ const tx=(d?.type?.text||"").toLowerCase();
       const tm=d.team?.id===home.team?.id?a:b;
-      if(d.scoringPlay && !/own goal/.test(tx)){ const nm=d.athletesInvolved?.[0]?.displayName; if(nm){ const k=nm+"|"+tm; (scorerMap[k]=scorerMap[k]||{p:nm,t:tm,g:0}).g++; } }
       if(stage==="group"){
         if(/yellow.?red|second yellow/.test(tx)) disc[tm]=(disc[tm]||0)-2;
         else if(/red card/.test(tx)) disc[tm]=(disc[tm]||0)-4;
@@ -420,8 +410,7 @@ async function fetchESPN(){
     });
   });
   upcoming.sort((a,b)=>a.koMs-b.koMs);
-  const scorers=Object.values(scorerMap).filter(s=>OWNER_OF[s.t]).sort((x,y)=>y.g-x.g).slice(0,15);
-  return { results, scorers, discipline: disc, upcoming: upcoming.slice(0,40), live };
+  return { results, discipline: disc, upcoming: upcoming.slice(0,40), live };
 }
 
 /* ---- ESPN's own official standings table — already FIFA-tiebreaker-correct server-side, so we mirror it
@@ -461,6 +450,35 @@ async function fetchESPNStandings(){
   if(!Object.keys(table).length) throw new Error("standings: no teams parsed");
   return table;
 }
+/* ---- Official Golden Boot leaderboard — mirrored verbatim from ESPN's stat leaders
+   feed rather than tallied ourselves from scoring-play events. ESPN's soccer "leaders"
+   coverage is less consistently documented than its standings/scoreboard endpoints, so
+   this tries a couple of known URL/shape variants and fails non-fatally if none work —
+   the Golden Boot board just shows "not available yet" rather than falling back to a
+   self-computed guess. ---- */
+async function fetchESPNTopScorers(){
+  const urls=[
+    "https://site.api.espn.com/apis/site/v3/sports/soccer/fifa.world/leaders",
+    "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/leaders",
+    "https://site.web.api.espn.com/apis/site/v3/sports/soccer/fifa.world/leaders",
+  ];
+  let data=null, lastErr=null;
+  for(const u of urls){ try{ const r=await fetch(u); if(!r.ok) throw new Error("HTTP "+r.status); data=await r.json(); if(data) break; }catch(e){ lastErr=e; } }
+  if(!data) throw new Error("leaders unreachable — "+(lastErr?lastErr.message:"no response"));
+  // Shape varies by sport/endpoint version — look through whichever category list is
+  // present for the one that's actually goals scored.
+  const cats=data.leaders||data.categories||(data.leaders?.categories)||[];
+  const goalsCat=cats.find(c=>/goal/i.test(c?.name||c?.displayName||c?.abbreviation||""));
+  const entries=goalsCat?.leaders||[];
+  if(!entries.length) throw new Error("leaders: no goals category found");
+  const scorers=entries.map(e=>{
+    const t=resolveTeam(e.team||e.athlete?.team); const p=e.athlete?.displayName||e.athlete?.shortName||null;
+    const g=e.value!=null?e.value:parseFloat(e.displayValue);
+    return (t&&p&&Number.isFinite(g))?{p,t,g}:null;
+  }).filter(Boolean).filter(s=>OWNER_OF[s.t]).sort((x,y)=>y.g-x.g).slice(0,15);
+  if(!scorers.length) throw new Error("leaders: no sweepstake-team scorers parsed");
+  return scorers;
+}
 async function fetchLive(){
   let core;
   try{ core = await fetchESPN(); }                  // primary: complete + accurate on a normal page
@@ -468,7 +486,9 @@ async function fetchLive(){
     catch(eS){ throw new Error(`sync failed — ${eE.message}`); } }
   let officialStandings=null;
   try{ officialStandings = await fetchESPNStandings(); }catch(e){ /* non-fatal: Groups tab falls back to our own table */ }
-  return { ...core, officialStandings };
+  let officialScorers=null;
+  try{ officialScorers = await fetchESPNTopScorers(); }catch(e){ /* non-fatal: Golden Boot just shows "not available yet" */ }
+  return { ...core, officialStandings, officialScorers };
 }
 
 function mergeLive(prev,p){
@@ -489,9 +509,9 @@ function mergeLive(prev,p){
     }
   });
   next.groupResults=gr; next.ko=ko;
-  next.autoScorers=(p.scorers||[]).filter(s=>OWNER_OF[s.t]).slice(0,20);
   next.discipline=p.discipline||{};
   if(p.officialStandings) next.officialStandings=p.officialStandings;
+  if(p.officialScorers) next.officialScorers=p.officialScorers;
   if(p.upcoming) next.upcoming=p.upcoming;
   next.live=p.live||[]; // always fresh — live state is transient, never "locked"
   // Store result dates: merge into a date map {fixtureKey -> ISO}
@@ -581,15 +601,11 @@ function analyse(state){
   const h2hPlayed=h2hRanked.some(o=>o.p>0);
   const loser = h2hPlayed ? h2hRanked[h2hRanked.length-1] : null;   // Absolute Loser = bottom of the head-to-head table
 
-  // Golden Boot — FIFA rule: most goals; ties broken by most assists; ties still
-  // remaining broken by FEWEST minutes played (the more efficient player ranks higher).
-  // a (assists) / m (minutes) default to undefined when not yet recorded — unknown
-  // minutes are treated as worse than any known value so they never win that tiebreak
-  // by accident, and unknown assists count as 0 rather than disappearing from the list.
-  const scMap=new Map();
-  (state.autoScorers||[]).forEach(s=>{if(OWNER_OF[s.t])scMap.set(s.p+"|"+s.t,{p:s.p,t:s.t,g:s.g,a:s.a,m:s.m,src:"auto"});});
-  (state.scorers||[]).forEach(s=>{if(OWNER_OF[s.t])scMap.set(s.p+"|"+s.t,{p:s.p,t:s.t,g:s.g,a:s.a,m:s.m,src:"manual"});});
-  const scorers=[...scMap.values()].sort((x,y)=>y.g-x.g||((y.a||0)-(x.a||0))||((x.m??Infinity)-(y.m??Infinity))).slice(0,15);
+  // Golden Boot — mirrors ESPN's official top-scorers leaderboard verbatim (state.officialScorers,
+  // already in rank order) rather than tallying goals ourselves from match events. If that feed
+  // isn't available (sync hasn't run, or ESPN's leaders endpoint is unreachable in this context),
+  // the list is simply empty — no self-computed fallback.
+  const scorers=(state.officialScorers||[]).filter(s=>OWNER_OF[s.t]).slice(0,15);
 
   // Golden Glove — entertainment-only ranking (FIFA's actual award is a Technical Study
   // Group selection, not derived from stats). Ranked by most clean sheets, by team.
@@ -598,13 +614,11 @@ function analyse(state){
   ko.forEach(m=>{ if(m.hs!=null&&m.as!=null){ if(m.as===0)cs[m.a]++; if(m.hs===0)cs[m.b]++; }});
   const cleanSheets=ALL_TEAMS.map(t=>({t,owner:OWNER_OF[t],cs:cs[t]})).filter(x=>x.cs>0).sort((a,b)=>b.cs-a.cs||strength(b.t)-strength(a.t)).slice(0,15);
 
-  // Holder badge is ranking-driven: now that the ranking itself applies the full
-  // official rule (goals, then assists, then fewest minutes), the player on top
-  // genuinely is the winner. A tie for the badge only persists if goals, assists,
-  // AND minutes are all identical between players (anything less and the rule has
-  // already separated them, so it's not a real tie).
+  // Holder badge: whoever sits 1st in the official list IS the holder — no recomputation,
+  // no tie logic of our own. If ESPN's list itself shows multiple names tied at the very
+  // top value, they all get the badge; otherwise it's just the single #1 entry.
   const bootWinners = scorers.length
-    ? [...new Set(scorers.filter(s=>s.g===scorers[0].g && (s.a||0)===(scorers[0].a||0) && s.m===scorers[0].m).map(s=>OWNER_OF[s.t]).filter(Boolean))]
+    ? [...new Set(scorers.filter(s=>s.g===scorers[0].g).map(s=>OWNER_OF[s.t]).filter(Boolean))]
     : [];
 
   return { standings,complete,allComplete,teamOut,owner,ownerRanked,champion,h2hRanked,loser,h2hPlayed,
@@ -836,7 +850,7 @@ function GroupsView({A}){
                       <div>
                         <div style={{display:"flex",alignItems:"center",gap:6}}>
                           <div style={{color:C.text,fontWeight:600,fontSize:13,lineHeight:1.25,whiteSpace:"nowrap"}}>{s.name}</div>
-                          {isLiveHere && <span style={{display:"inline-flex",alignItems:"center",gap:3,font:"800 8px Inter",letterSpacing:".5px",color:C.red,whiteSpace:"nowrap"}}><i className="live-dot"/>LIVE {liveM.my}-{liveM.opp} v {liveM.opponent}{liveM.clock?` · ${liveM.clock}`:""}</span>}
+                          {isLiveHere && <span style={{display:"inline-flex",alignItems:"center",gap:3,font:"800 8px Inter",letterSpacing:".5px",color:C.red,whiteSpace:"nowrap"}}><i className="live-dot"/>LIVE</span>}
                         </div>
                         <div style={{font:"700 8px Inter",letterSpacing:".3px",textTransform:"uppercase",color:OWNER_COLOR[OWNER_OF[s.name]],lineHeight:1.2,whiteSpace:"nowrap"}}>{OWNER_OF[s.name]}</div>
                       </div>
@@ -881,7 +895,7 @@ function KoCard({m,live}){ const wl=koWL(m);
     {wl&&wl.w===team&&<span style={{marginLeft:"auto",font:"700 11px Inter",color:C.green}}>WON</span>}
     <span className="display" style={{marginLeft:wl&&wl.w===team?8:"auto",fontSize:20,color:C.text}}>{score==null?"–":score}{pen!=null?<sup style={{fontSize:11,color:C.gold}}> ({pen})</sup>:null}</span></div>);
   return <div className="card" style={{padding:"4px 14px"}}>
-    {live && <div style={{display:"flex",alignItems:"center",gap:5,padding:"6px 0 0",font:"800 9px Inter",letterSpacing:"1px",textTransform:"uppercase",color:C.red}}><i className="live-dot"/>Live{live.clock?` · ${live.clock}`:""}{live.detail?` · ${live.detail}`:""}</div>}
+    {live && <div style={{display:"flex",alignItems:"center",gap:5,padding:"6px 0 0",font:"800 9px Inter",letterSpacing:"1px",textTransform:"uppercase",color:C.red}}><i className="live-dot"/>Live</div>}
     {row(m.a,hs,m.pa)}<div style={{height:1,background:C.line}}/>{row(m.b,as,m.pb)}</div>;
 }
 
@@ -939,8 +953,8 @@ function ScorerBoard({A}){
   const topVal=list.length?list[0].g:0;
   return (
     <div className="card" style={{padding:14}}>
-      <BoardHead emoji="⚽" title="Golden Boot" sub="Most goals, then assists, then fewest minutes played" holders={winners}/>
-      {list.length===0 && <div style={{font:"500 12px Inter",color:C.muted}}>No goals recorded yet — these appear after the next sync.</div>}
+      <BoardHead emoji="⚽" title="Golden Boot" sub="Official top scorers leaderboard" holders={winners}/>
+      {list.length===0 && <div style={{font:"500 12px Inter",color:C.muted}}>Not available yet — appears once the official leaderboard publishes results.</div>}
       <div style={{display:"grid",gap:2}}>{list.map((s,i)=>{
         const tied=s.g===topVal;
         return (
@@ -949,11 +963,7 @@ function ScorerBoard({A}){
           <span style={{font:"600 13px Inter",color:C.text}}>{s.p}</span>
           <span style={{display:"inline-flex",alignItems:"center",gap:5}}><FlagDot team={s.t}/><span style={{font:"500 11px Inter",color:C.muted}}>{s.t}</span></span>
           <span className="owntag" style={{color:OWNER_COLOR[OWNER_OF[s.t]]}}>{OWNER_OF[s.t]}</span>
-          <span style={{marginLeft:"auto",display:"flex",alignItems:"baseline",gap:8}}>
-            <span style={{font:"500 10px Inter",color:C.muted}}>{s.a??"–"} ast</span>
-            <span style={{font:"500 10px Inter",color:C.muted}}>{s.m!=null?s.m+"′":"–"}</span>
-            <span className="display" style={{fontSize:18,color:tied?C.gold:C.text}}>{s.g}</span>
-          </span>
+          <span className="display" style={{marginLeft:"auto",fontSize:18,color:tied?C.gold:C.text}}>{s.g}</span>
         </div>);})}</div>
       <Prize value="£10" splitCount={winners.length}/>
     </div>

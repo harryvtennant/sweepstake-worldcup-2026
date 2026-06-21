@@ -601,19 +601,24 @@ function analyse(state){
   const h2hPlayed=h2hRanked.some(o=>o.p>0);
   const loser = h2hPlayed ? h2hRanked[h2hRanked.length-1] : null;   // Absolute Loser = bottom of the head-to-head table
 
+  // golden boot: auto + manual scorers
+  const scMap=new Map();
+  (state.autoScorers||[]).forEach(s=>{if(OWNER_OF[s.t])scMap.set(s.p+"|"+s.t,{p:s.p,t:s.t,g:s.g,src:"auto"});});
+  (state.scorers||[]).forEach(s=>{if(OWNER_OF[s.t])scMap.set(s.p+"|"+s.t,{p:s.p,t:s.t,g:s.g,src:"manual"});});
+  const scorers=[...scMap.values()].sort((a,b)=>b.g-a.g).slice(0,15);
   // Golden Boot — mirrors ESPN's official top-scorers leaderboard verbatim (state.officialScorers,
   // already in rank order) rather than tallying goals ourselves from match events. If that feed
   // isn't available (sync hasn't run, or ESPN's leaders endpoint is unreachable in this context),
   // the list is simply empty — no self-computed fallback.
   const scorers=(state.officialScorers||[]).filter(s=>OWNER_OF[s.t]).slice(0,15);
 
-  // Golden Glove — entertainment-only ranking (FIFA's actual award is a Technical Study
-  // Group selection, not derived from stats). Ranked by most clean sheets, by team.
+  // golden glove: clean sheets per team derived from all results
   const cs={}; ALL_TEAMS.forEach(t=>cs[t]=0);
   GROUP_LETTERS.forEach(L=>FIXTURES[L].forEach(fx=>{const r=results[fx.id]; if(r&&r.hs!=null){ if(r.as===0)cs[fx.a]++; if(r.hs===0)cs[fx.b]++; }}));
   ko.forEach(m=>{ if(m.hs!=null&&m.as!=null){ if(m.as===0)cs[m.a]++; if(m.hs===0)cs[m.b]++; }});
   const cleanSheets=ALL_TEAMS.map(t=>({t,owner:OWNER_OF[t],cs:cs[t]})).filter(x=>x.cs>0).sort((a,b)=>b.cs-a.cs||strength(b.t)-strength(a.t)).slice(0,15);
 
+  const bootWinners = tiedWinners(scorers, s=>s.g, s=>OWNER_OF[s.t]);
   // Holder badge: whoever sits 1st in the official list IS the holder — no recomputation,
   // no tie logic of our own. If ESPN's list itself shows multiple names tied at the very
   // top value, they all get the badge; otherwise it's just the single #1 entry.
@@ -953,6 +958,9 @@ function ScorerBoard({A}){
   const topVal=list.length?list[0].g:0;
   return (
     <div className="card" style={{padding:14}}>
+      <BoardHead emoji="⚽" title="Golden Boot" sub="Most goals, then assists, then fewest mins played" holders={winners}/>
+      <div style={{font:"500 12px Inter",color:C.muted,marginBottom:8}}>The rankings below are only based on goals. Refer to official FIFA rankings for the official Golden Boot winner.</div>
+      {list.length===0 && <div style={{font:"500 12px Inter",color:C.muted}}>No goals recorded yet — these appear after the next sync.</div>}
       <BoardHead emoji="⚽" title="Golden Boot" sub="Official top scorers leaderboard" holders={winners}/>
       {list.length===0 && <div style={{font:"500 12px Inter",color:C.muted}}>Not available yet — appears once the official leaderboard publishes results.</div>}
       <div style={{display:"grid",gap:2}}>{list.map((s,i)=>{

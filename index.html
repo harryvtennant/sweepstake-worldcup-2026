@@ -219,7 +219,7 @@ const STATE_KEY="wc26x:state:v1", CONFIG_KEY="wc26x:config:v1";
 const SEED_RESULTS={ "A-02":{hs:2,as:0,src:"auto"},"A-13":{hs:2,as:1,src:"auto"},
   "B-03":{hs:1,as:1,src:"auto"},"B-12":{hs:1,as:1,src:"auto"},"E-03":{hs:7,as:1,src:"auto"},"F-01":{hs:2,as:2,src:"auto"} };
 const DEFAULT_STATE={ groupResults:SEED_RESULTS, ko:[], awards:{champion:null, goldenBoot:null},
-  scorers:[], keepers:[], autoScorers:[], discipline:{}, officialStandings:null,
+  scorers:[], keepers:[], autoScorers:[], autoKeepers:[], discipline:{}, officialStandings:null,
   upcoming:[], live:[], resultDates:{}, odds:{}, lastSync:null, syncError:null };
 const hasStore = typeof window!=="undefined" && window.storage;
 
@@ -290,6 +290,7 @@ function App(){
             <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8}}><Crest owner={leader.owner} size={26}/><span className="display" style={{fontSize:22,color:C.text}}>{leader.owner}</span><span style={{marginLeft:"auto",fontSize:15}}>👑</span></div>
           </div>
         </div>
+        <LiveAndNextStrip A={A}/>
         <SyncBar state={state} syncing={syncing} onSync={doSync}/>
       </div>
 
@@ -354,6 +355,7 @@ async function fetchSearch(){
 
 /* ---- ESPN public feed: complete, every group, every match (works on a normal web page / GitHub Pages) ---- */
 const ESPN_URL="https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard";
+const ESPN_SUMMARY_URL="https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/summary";
 function allTournamentDates(){ const out=[],start=Date.UTC(2026,5,11),end=Date.UTC(2026,6,19);
   for(let t=start;t<=end;t+=86400000){const d=new Date(t);out.push(`${d.getUTCFullYear()}${String(d.getUTCMonth()+1).padStart(2,"0")}${String(d.getUTCDate()).padStart(2,"0")}`);} return out; }
 function numOrNull(v){const n=parseInt(v,10);return Number.isFinite(n)?n:null;}
@@ -375,7 +377,7 @@ async function fetchESPN(){
   const events=[], seen=new Set();
   ok.forEach(s=>(s.value.events||[]).forEach(ev=>{ if(ev.id&&!seen.has(ev.id)){ seen.add(ev.id); events.push(ev); } }));
   if(!events.length) throw new Error("ESPN returned nothing");
-  const results=[], scorerMap={}, disc={}, upcoming=[], live=[];
+  const results=[], scorerMap={}, disc={}, upcoming=[], live=[], completedForStats=[];
   const now=Date.now();
   events.forEach(ev=>{ const comp=ev.competitions?.[0]; if(!comp) return;
     const cs=comp.competitors||[]; const home=cs.find(c=>c.homeAway==="home")||cs[0]; const away=cs.find(c=>c.homeAway==="away")||cs[1]; if(!home||!away) return;
@@ -409,6 +411,7 @@ async function fetchESPN(){
     const ga=parseInt(home.score,10), gb=parseInt(away.score,10); if(!Number.isFinite(ga)||!Number.isFinite(gb)) return;
     const stage=espnStage(ev,comp,a,b);
     results.push({stage,a,b,ga,gb,pa:numOrNull(home.shootoutScore),pb:numOrNull(away.shootoutScore),date:evDate});
+    if(OWNER_OF[a]||OWNER_OF[b]) completedForStats.push({id:ev.id,a,b,homeTeamId:home.team?.id,awayTeamId:away.team?.id});
     (comp.details||[]).forEach(d=>{ const tx=(d?.type?.text||"").toLowerCase();
       const tm=d.team?.id===home.team?.id?a:b;
       if(d.scoringPlay && !/own goal/.test(tx)){ const nm=d.athletesInvolved?.[0]?.displayName; if(nm){ const k=nm+"|"+tm; (scorerMap[k]=scorerMap[k]||{p:nm,t:tm,g:0}).g++; } }
@@ -420,8 +423,177 @@ async function fetchESPN(){
     });
   });
   upcoming.sort((a,b)=>a.koMs-b.koMs);
-  const scorers=Object.values(scorerMap).filter(s=>OWNER_OF[s.t]).sort((x,y)=>y.g-x.g).slice(0,15);
-  return { results, scorers, discipline: disc, upcoming: upcoming.slice(0,40), live };
+  let autoKeepers=[];
+  try{
+    const {scorerExtra,gkExtra}=await fetchPlayerStats(completedForStats);
+    Object.entries(scorerExtra).forEach(([key,v])=>{
+      if(scorerMap[key]){ scorerMap[key].a=(scorerMap[key].a||0)+v.a; scorerMap[key].min=(scorerMap[key].min||0)+v.min;
+        scorerMap[key].matches=(scorerMap[key].matches||[]).concat(v.matches||[]); }
+    });
+    autoKeepers=Object.entries(gkExtra).map(([key,v])=>{
+      const [p,t]=key.split("|");
+      return {p,t,cs:v.cs,saves:v.saves,min:v.min,matches:v.matches||[]};
+    }).filter(k=>OWNER_OF[k.t])
+      .sort((a,b)=>b.cs-a.cs || b.saves-a.saves || a.min-b.min).slice(0,20);
+  }catch(e){ /* non-fatal: Golden Boot still shows goals-only ranking, Golden Glove stays empty if this fails */ }
+  const scorers=Object.values(scorerMap).filter(s=>OWNER_OF[s.t])
+    .sort((x,y)=>y.g-x.g || (y.a||0)-(x.a||0) || (x.min??9999)-(y.min??9999)).slice(0,15);
+  return { results, scorers, autoKeepers, discipline: disc, upcoming: upcoming.slice(0,40), live };
+}
+
+/* ---- Golden Boot enrichment: assists + minutes played, per FIFA tiebreaker order
+   (goals -> assists -> fewest minutes). Goals already come reliably from the
+   scoreboard's `comp.details` scoring-play events above. Assists and minutes are
+   NOT exposed there — ESPN's soccer boxscore only carries them per-match via the
+   `summary?event=` endpoint, so this fetches that endpoint once per completed
+   match and folds the totals into the existing scorerMap by the same "name|team"
+   key already used for goals. Defensive throughout: if ESPN's real field names
+   differ from the documented shape, a match's enrichment is silently skipped
+   (goals still display correctly) rather than breaking the whole sync. ---- */
+function parseMatchLength(displayClock){
+  if(!displayClock) return 90;
+  const m=/^(\d+)'(?:\+(\d+)')?/.exec(displayClock);
+  if(!m) return 90;
+  return (parseInt(m[1],10)||90)+(parseInt(m[2],10)||0);
+}
+function parseMinuteMark(clockText){
+  if(!clockText) return null;
+  const m=/^(\d+)'(?:\+(\d+)')?/.exec(clockText);
+  if(!m) return null;
+  return (parseInt(m[1],10)||0)+(parseInt(m[2],10)||0);
+}
+async function fetchPlayerStats(completedForStats){
+  if(!completedForStats.length) return {scorerExtra:{}, gkExtra:{}};
+  const settled=await Promise.allSettled(completedForStats.map(ev=>
+    fetch(`${ESPN_SUMMARY_URL}?event=${ev.id}`).then(r=>{ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); }).then(json=>({ev,json}))));
+  const scorerExtra={}, gkExtra={};
+  settled.forEach(s=>{
+    if(s.status!=="fulfilled") return;
+    try{
+      const {ev,json}=s.value;
+      const comp=json?.header?.competitions?.[0];
+      const rosters=json?.rosters||json?.boxscore?.players||[];
+
+      const flatEntries=[];
+      rosters.forEach(teamRoster=>{
+        const teamId=teamRoster.team?.id;
+        const teamName=teamId===ev.homeTeamId?ev.a:(teamId===ev.awayTeamId?ev.b:null);
+        if(!teamName) return;
+        const entries=teamRoster.roster||teamRoster.statistics?.[0]?.athletes||[];
+        entries.forEach(entry=>flatEntries.push({entry,teamName}));
+      });
+
+      // ESPN's match clock follows standard broadcast convention: second-half timestamps
+      // (e.g. "80'", "90'+8'") do NOT include first-half stoppage -- "Start 2nd Half" is
+      // labelled "45'", not "49'", even when 4 minutes were added in the 1st half (confirmed
+      // real data). So any clearly-second-half timestamp (base minute >45) needs the 1st-half
+      // stoppage added back to get true elapsed on-pitch minutes; 1st-half timestamps (base <45)
+      // are already literal elapsed time and need no adjustment.
+      const keyEvents=json?.keyEvents||[];
+      const halftimeEvt=keyEvents.find(e=>e?.type?.type==="halftime");
+      const halfOneAdded=halftimeEvt?Math.max(0,(parseMinuteMark(halftimeEvt.clock?.displayValue)||45)-45):0;
+      const realMinute=(displayValue)=>{
+        const m=/^(\d+)'(?:\+(\d+)')?/.exec(displayValue||"");
+        if(!m) return null;
+        const raw=(parseInt(m[1],10)||0)+(parseInt(m[2],10)||0);
+        return (parseInt(m[1],10)||0)>45 ? raw+halfOneAdded : raw;
+      };
+
+      const endRegEvt=keyEvents.find(e=>e?.type?.type==="end-regular-time");
+      let matchLen=endRegEvt?realMinute(endRegEvt.clock?.displayValue):null;
+      // 2nd-half stoppage: the "+X" part of the full-time clock (e.g. "90+5'" -> 5 mins),
+      // read straight off the same end-of-regulation event used for matchLen above.
+      const endDisp=endRegEvt?.clock?.displayValue||"";
+      const endM=/^(\d+)'(?:\+(\d+)')?/.exec(endDisp);
+      const halfTwoAdded=(endM && (parseInt(endM[1],10)||0)>45) ? (parseInt(endM[2],10)||0) : 0;
+      if(matchLen==null){
+        // Fallback for matches missing this marker (e.g. unexpected feed gaps): old proxy.
+        let maxPlayMinute=0;
+        flatEntries.forEach(({entry})=>(entry.plays||[]).forEach(p=>{
+          const m=parseMinuteMark(p.clock?.displayValue); if(m!=null&&m>maxPlayMinute) maxPlayMinute=m;
+        }));
+        matchLen=Math.max(parseMatchLength(comp?.status?.displayClock), maxPlayMinute);
+      }
+
+      // Splits any [start,end] real-minute window into "regular time" vs "stoppage time"
+      // played, where stoppage = the 1st-half stoppage window (45 -> 45+halfOneAdded) plus
+      // the 2nd-half stoppage window (90+halfOneAdded -> matchLen). Used purely for the
+      // audit display below; the raw end-start minute count is unaffected either way.
+      const splitRegularStoppage=(start,end)=>{
+        const overlap=(aS,aE,bS,bE)=>Math.max(0,Math.min(aE,bE)-Math.max(aS,bS));
+        const h1Stop=overlap(start,end,45,45+halfOneAdded);
+        const h2Stop=overlap(start,end,90+halfOneAdded,matchLen);
+        const stoppage=h1Stop+h2Stop;
+        return { regular: Math.max(0,(end-start)-stoppage), stoppage };
+      };
+
+      // Minutes-played calculation -- identical logic for every player regardless of
+      // position (starters run 0 -> sub-off/full-time, subs run sub-on -> full-time,
+      // red cards cap the end), since plays[]/starter/subbedOut/subbedIn behave the
+      // same way for goalkeepers as outfielders.
+      // Returns {min, detail} -- detail is a plain-English audit trail of exactly how `min`
+      // was derived for this player in this match, so totals shown in the app can always be
+      // traced back to specific clock events instead of taken on trust.
+      const minutesFor=(entry)=>{
+        if(!entry.starter && !entry.subbedIn) return {min:0, detail:{role:"Did not play",start:0,end:0,matchLen,regular:0,stoppage:0,note:"Not a starter and never subbed on"}};
+        const plays=entry.plays||[];
+        const subReal=plays.filter(p=>p.substitution).map(p=>realMinute(p.clock?.displayValue)).filter(v=>v!=null).sort((a,b)=>a-b);
+        const redCardPlay=plays.find(p=>p.redCard);
+        const redReal=redCardPlay?realMinute(redCardPlay.clock?.displayValue):null;
+        let start=0, end=matchLen, role, subEvent=null;
+        if(entry.starter){
+          role="Started";
+          if(entry.subbedOut){ end=subReal[0]??matchLen; subEvent=subReal[0]??null; }
+        } else {
+          role="Substitute";
+          start=subReal[0]??0;
+          if(entry.subbedOut && subReal.length>1){ end=subReal[1]; subEvent=subReal[1]; }
+        }
+        const redCardApplied = redReal!=null && redReal<end;
+        if(redReal!=null) end=Math.min(end,redReal);
+        end=Math.max(start,end);
+        const {regular,stoppage}=splitRegularStoppage(start,end);
+        return {min:Math.max(0,end-start), detail:{role,start,end,matchLen,regular,stoppage,subEvent,redCard:redCardApplied?redReal:null,halfOneAdded,halfTwoAdded}};
+      };
+
+      flatEntries.forEach(({entry,teamName})=>{
+        const athleteId=entry.athlete?.id||entry.id;
+        const name=entry.athlete?.displayName||entry.displayName;
+        if(!athleteId||!name) return;
+        const stats=entry.stats||entry.statistics||[];
+        const findStat=(...keys)=>stats.find(st=>{ const n=(st.name||st.abbreviation||"").toLowerCase(); return keys.includes(n); });
+        const statVal=(st)=>st?(parseInt(st.displayValue??st.value,10)||0):0;
+
+        const isGK=/goalkeeper|^gk$|^g$/i.test(entry.position?.name||entry.position?.abbreviation||"");
+        const {min:minutes, detail:minDetail}=minutesFor(entry);
+        const opponent = teamName===ev.a ? ev.b : ev.a;
+        const matchLogEntry = { opponent, eventId: ev.id, ...minDetail, min: minutes };
+
+        if(isGK){
+          const conceded=statVal(findStat("goalsconceded","ga"));
+          const directSaves=findStat("saves","sv");
+          let saves;
+          if(directSaves){
+            saves=statVal(directSaves);
+          } else {
+            const shotsFaced=statVal(findStat("shotsfaced","shf","shotsongoal","soga"));
+            saves=Math.max(0,shotsFaced-conceded);
+          }
+          const cleanSheet=minutes>0 && conceded===0 ? 1 : 0;
+          const key=name+"|"+teamName;
+          const cur=gkExtra[key]||{cs:0,saves:0,min:0,matches:[]};
+          cur.cs+=cleanSheet; cur.saves+=saves; cur.min+=minutes; cur.matches.push(matchLogEntry); gkExtra[key]=cur;
+        } else {
+          const assistStat=findStat("goalassists","assists","a");
+          const assists=statVal(assistStat);
+          const key=name+"|"+teamName;
+          const cur=scorerExtra[key]||{a:0,min:0,matches:[]};
+          cur.a+=assists; cur.min+=minutes; cur.matches.push(matchLogEntry); scorerExtra[key]=cur;
+        }
+      });
+    }catch(e){ /* skip this match's enrichment only — goals still synced fine */ }
+  });
+  return {scorerExtra, gkExtra};
 }
 
 /* ---- ESPN's own official standings table — already FIFA-tiebreaker-correct server-side, so we mirror it
@@ -490,6 +662,7 @@ function mergeLive(prev,p){
   });
   next.groupResults=gr; next.ko=ko;
   next.autoScorers=(p.scorers||[]).filter(s=>OWNER_OF[s.t]).slice(0,20);
+  next.autoKeepers=(p.autoKeepers||[]).filter(k=>OWNER_OF[k.t]).slice(0,20);
   next.discipline=p.discipline||{};
   if(p.officialStandings) next.officialStandings=p.officialStandings;
   if(p.upcoming) next.upcoming=p.upcoming;
@@ -581,23 +754,28 @@ function analyse(state){
   const h2hPlayed=h2hRanked.some(o=>o.p>0);
   const loser = h2hPlayed ? h2hRanked[h2hRanked.length-1] : null;   // Absolute Loser = bottom of the head-to-head table
 
-  // golden boot: auto + manual scorers
+  // golden boot: auto + manual scorers, ranked by FIFA's official tiebreaker order
+  // (most goals -> most assists -> fewest minutes played). Manual entries don't
+  // collect assists/minutes via the admin form, so they default to 0/unknown and
+  // simply rank below any auto-synced player they're tied on goals with.
   const scMap=new Map();
-  (state.autoScorers||[]).forEach(s=>{if(OWNER_OF[s.t])scMap.set(s.p+"|"+s.t,{p:s.p,t:s.t,g:s.g,src:"auto"});});
-  (state.scorers||[]).forEach(s=>{if(OWNER_OF[s.t])scMap.set(s.p+"|"+s.t,{p:s.p,t:s.t,g:s.g,src:"manual"});});
-  const scorers=[...scMap.values()].sort((a,b)=>b.g-a.g).slice(0,15);
+  (state.autoScorers||[]).forEach(s=>{if(OWNER_OF[s.t])scMap.set(s.p+"|"+s.t,{p:s.p,t:s.t,g:s.g,a:s.a||0,min:s.min,matches:s.matches||[],src:"auto"});});
+  (state.scorers||[]).forEach(s=>{if(OWNER_OF[s.t])scMap.set(s.p+"|"+s.t,{p:s.p,t:s.t,g:s.g,a:s.a||0,min:s.min,matches:s.matches||[],src:"manual"});});
+  const scorers=[...scMap.values()].sort((a,b)=>b.g-a.g || (b.a||0)-(a.a||0) || (a.min??9999)-(b.min??9999)).slice(0,15);
 
-  // golden glove: clean sheets per team derived from all results
-  const cs={}; ALL_TEAMS.forEach(t=>cs[t]=0);
-  GROUP_LETTERS.forEach(L=>FIXTURES[L].forEach(fx=>{const r=results[fx.id]; if(r&&r.hs!=null){ if(r.as===0)cs[fx.a]++; if(r.hs===0)cs[fx.b]++; }}));
-  ko.forEach(m=>{ if(m.hs!=null&&m.as!=null){ if(m.as===0)cs[m.a]++; if(m.hs===0)cs[m.b]++; }});
-  const cleanSheets=ALL_TEAMS.map(t=>({t,owner:OWNER_OF[t],cs:cs[t]})).filter(x=>x.cs>0).sort((a,b)=>b.cs-a.cs||strength(b.t)-strength(a.t)).slice(0,15);
+  // golden glove: per-goalkeeper clean sheets/saves/minutes, auto + manual, ranked by
+  // clean sheets -> saves -> fewest minutes (display ordering only -- the real winner
+  // is picked by the FIFA Technical Study Group, as the card's own text already says).
+  const gkMap=new Map();
+  (state.autoKeepers||[]).forEach(k=>{if(OWNER_OF[k.t])gkMap.set(k.p+"|"+k.t,{p:k.p,t:k.t,cs:k.cs||0,saves:k.saves||0,min:k.min,matches:k.matches||[],src:"auto"});});
+  (state.keepers||[]).forEach(k=>{if(OWNER_OF[k.t])gkMap.set(k.p+"|"+k.t,{p:k.p,t:k.t,cs:k.cs||0,saves:k.saves||0,min:k.min,matches:k.matches||[],src:"manual"});});
+  const keepers=[...gkMap.values()].sort((a,b)=>b.cs-a.cs || b.saves-a.saves || (a.min??9999)-(b.min??9999)).slice(0,20);
 
-  const bootWinners = tiedWinners(scorers, s=>s.g, s=>OWNER_OF[s.t]);
+  const bootWinners = tiedWinners(scorers, s=>`${s.g}|${s.a||0}|${s.min??"x"}`, s=>OWNER_OF[s.t]);
 
   return { standings,complete,allComplete,teamOut,owner,ownerRanked,champion,h2hRanked,loser,h2hPlayed,
     usingOfficial: !!official, upcoming, live, liveStandings, liveTeamInfo,
-    clashes:clashes.slice().reverse(), scorers, cleanSheets, bootLeader:scorers[0]||null, gloveLeader:cleanSheets[0]||null,
+    clashes:clashes.slice().reverse(), scorers, keepers, bootLeader:scorers[0]||null, gloveLeader:keepers[0]||null,
     bootWinners };
 }
 
@@ -650,6 +828,58 @@ function fmtMatchDate(iso){
   if(!iso) return null;
   try{ return new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/London",weekday:"short",day:"numeric",month:"short",hour:"2-digit",minute:"2-digit",hour12:false}).format(new Date(iso))+" (UK)"; }
   catch(e){ return null; }
+}
+
+// Top-of-page summary: whichever pooled-team match is live right now, plus the next
+// upcoming one. Same data/logic as the (filterable) boxes inside the H2H tab, just
+// always unfiltered -- a quick glance without needing to open a tab.
+function LiveAndNextStrip({A}){
+  const nowMs=Date.now();
+  const liveAll=A.live||[];
+  const upAll=(A.upcoming||[]).filter(u=>u.a&&u.b&&OWNER_OF[u.a]&&OWNER_OF[u.b]&&u.koMs>nowMs);
+  let nextFx=[];
+  if(upAll.length){ const e=upAll[0].koMs; nextFx=upAll.filter(u=>u.koMs-e<60000); }
+  if(liveAll.length===0 && nextFx.length===0) return null;
+  return (
+    <div style={{display:"grid",gap:10,marginTop:14}}>
+      {liveAll.length>0 && (
+        <div className="card" style={{padding:"10px 12px",borderColor:"rgba(63,215,139,.35)"}}>
+          <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}>
+            <span style={{width:7,height:7,borderRadius:"50%",background:C.green,boxShadow:`0 0 6px ${C.green}`}}/>
+            <span style={{font:"700 9px Inter",letterSpacing:"1px",color:C.green,textTransform:"uppercase"}}>Live now</span>
+          </div>
+          {liveAll.map((m,i)=>(
+            <div key={i}>
+              {i>0&&<div style={{height:1,background:C.line,margin:"6px 0"}}/>}
+              <div style={{font:"600 9px Inter",color:C.muted,marginBottom:3}}>{m.stage}{m.detail?` · ${m.detail}`:m.clock?` · ${m.clock}`:""}</div>
+              <ClashSide team={m.a} owner={OWNER_OF[m.a]} score={m.ga} pen={null} lose={false}/>
+              <ClashSide team={m.b} owner={OWNER_OF[m.b]} score={m.gb} pen={null} lose={false}/>
+            </div>
+          ))}
+        </div>
+      )}
+      {nextFx.length>0 && (
+        <div className="card" style={{padding:"10px 12px"}}>
+          <div style={{font:"700 9px Inter",letterSpacing:"1px",color:C.gold,textTransform:"uppercase",marginBottom:6}}>
+            {`Next match${nextFx.length>1?"es":""}`}
+            {nextFx[0].ko&&<span style={{fontWeight:500,color:C.muted,marginLeft:8,textTransform:"none"}}>{fmtMatchDate(nextFx[0].ko)}</span>}
+          </div>
+          {nextFx.map((u,i)=>(
+            <div key={i}>
+              {i>0&&<div style={{height:1,background:C.line,margin:"4px 0"}}/>}
+              <div style={{display:"flex",alignItems:"center",gap:6,padding:"4px 0"}}>
+                <span style={{font:"600 12px Inter",color:C.text,flex:1,textAlign:"right"}}>{u.a}</span>
+                <span className="owntag" style={{color:OWNER_COLOR[OWNER_OF[u.a]]}}>{OWNER_OF[u.a]}</span>
+                <span style={{font:"800 11px Inter",color:C.muted,padding:"0 6px"}}>vs</span>
+                <span className="owntag" style={{color:OWNER_COLOR[OWNER_OF[u.b]]}}>{OWNER_OF[u.b]}</span>
+                <span style={{font:"600 12px Inter",color:C.text,flex:1}}>{u.b}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 // Clash sort: by real date (desc) if available, else by stage-order proxy
@@ -925,41 +1155,115 @@ function Prize({value,forfeit,splitCount}){
 function ScorerBoard({A}){
   const list=A.scorers, winners=A.bootWinners||[];
   const topVal=list.length?list[0].g:0;
+  const [open,setOpen]=useState(null);
   return (
     <div className="card" style={{padding:14}}>
       <BoardHead emoji="⚽" title="Golden Boot" sub="Most goals, then assists, then fewest mins played" holders={winners}/>
-      <div style={{font:"500 12px Inter",color:C.muted,marginBottom:8}}>The rankings below are only based on goals. Refer to official FIFA rankings for the official Golden Boot winner.</div>
       {list.length===0 && <div style={{font:"500 12px Inter",color:C.muted}}>No goals recorded yet — these appear after the next sync.</div>}
+      {list.length>0 &&
+        <div style={{display:"flex",alignItems:"center",gap:9,padding:"0 0 4px"}}>
+          <span style={{width:18}}/><span style={{flex:1}}/>
+          <span style={{width:28,textAlign:"center",font:"700 9px Inter",letterSpacing:".5px",color:C.muted}}>G</span>
+          <span style={{width:28,textAlign:"center",font:"700 9px Inter",letterSpacing:".5px",color:C.muted}}>A</span>
+          <span style={{width:40,textAlign:"center",font:"700 9px Inter",letterSpacing:".5px",color:C.muted}}>MIN</span>
+        </div>}
       <div style={{display:"grid",gap:2}}>{list.map((s,i)=>{
         const tied=s.g===topVal;
+        const key=s.p+s.t;
+        const expanded=open===key;
+        const hasAudit=(s.matches||[]).length>0;
         return (
-        <div key={s.p+s.t} style={{display:"flex",alignItems:"center",gap:9,padding:"6px 0",borderTop:i?"1px solid rgba(255,255,255,.05)":"none"}}>
+        <div key={key}>
+        <div onClick={()=>hasAudit&&setOpen(expanded?null:key)} style={{display:"flex",alignItems:"center",gap:9,padding:"6px 0",borderTop:i?"1px solid rgba(255,255,255,.05)":"none",cursor:hasAudit?"pointer":"default"}}>
           <span className="display" style={{width:18,textAlign:"center",fontSize:15,color:tied?C.gold:C.muted}}>{i+1}</span>
-          <span style={{font:"600 13px Inter",color:C.text}}>{s.p}</span>
-          <span style={{display:"inline-flex",alignItems:"center",gap:5}}><FlagDot team={s.t}/><span style={{font:"500 11px Inter",color:C.muted}}>{s.t}</span></span>
-          <span className="owntag" style={{color:OWNER_COLOR[OWNER_OF[s.t]]}}>{OWNER_OF[s.t]}</span>
-          <span className="display" style={{marginLeft:"auto",fontSize:18,color:tied?C.gold:C.text}}>{s.g}</span>
+          <div style={{display:"flex",alignItems:"center",gap:7,flex:1,minWidth:0}}>
+            <FlagDot team={s.t}/>
+            <div style={{minWidth:0}}>
+              <div style={{color:C.text,fontWeight:600,fontSize:13,lineHeight:1.25,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{s.p}</div>
+              <div style={{display:"flex",alignItems:"center",gap:5,lineHeight:1.2}}>
+                <span style={{font:"500 10px Inter",color:C.muted,whiteSpace:"nowrap"}}>{s.t}</span>
+                <span className="owntag" style={{color:OWNER_COLOR[OWNER_OF[s.t]]}}>{OWNER_OF[s.t]}</span>
+              </div>
+            </div>
+          </div>
+          <span className="display" style={{width:28,textAlign:"center",fontSize:16,color:tied?C.gold:C.text}}>{s.g}</span>
+          <span style={{width:28,textAlign:"center",font:"600 13px Inter",color:C.muted}}>{s.a||0}</span>
+          <span style={{width:40,textAlign:"center",font:"600 12px Inter",color:C.muted,textDecoration:hasAudit?"underline":"none",textDecorationStyle:"dotted"}}>{s.min!=null?`${s.min}'`:"—"}</span>
+        </div>
+        {expanded && <MinutesAudit matches={s.matches} total={s.min}/>}
         </div>);})}</div>
       <Prize value="£10" splitCount={winners.length}/>
     </div>
   );
 }
+// Shows exactly how a player's total minutes were built up: one row per match with
+// role (started/sub), the clock window counted, and any red card cap -- tap a MIN
+// value above to open this. Pulls straight from the same data the totals are computed
+// from, so it can never drift out of sync with what's actually being summed.
+function MinutesAudit({matches,total}){
+  const list=matches||[];
+  const sumRegular=list.reduce((s,m)=>s+(m.regular||0),0);
+  const sumStoppage=list.reduce((s,m)=>s+(m.stoppage||0),0);
+  return (
+    <div style={{margin:"0 0 8px 27px",padding:"8px 10px",background:"#0E1626",borderRadius:10,border:`1px solid ${C.line}`}}>
+      <div style={{font:"700 10px Inter",letterSpacing:".5px",textTransform:"uppercase",color:C.muted,marginBottom:6}}>Minutes audit — how {total}' was reached</div>
+      <div style={{display:"grid",gap:5}}>{list.map((m,i)=>(
+        <div key={i} style={{font:"500 11px Inter",color:C.text,lineHeight:1.4}}>
+          <span style={{color:C.gold,fontWeight:700}}>vs {m.opponent}: {m.min}'</span>
+          <span style={{color:C.muted}}> ({m.regular}' regular + {m.stoppage}' stoppage)</span>
+          <span style={{color:C.muted}}> — {m.role}, on pitch {m.start}'→{m.end}' (match length {m.matchLen}')</span>
+          {m.subEvent!=null && <span style={{color:C.muted}}> · subbed {m.role==="Started"?"off":"on"} at {m.subEvent}'</span>}
+          {m.redCard!=null && <span style={{color:C.red}}> · red card {m.redCard}'</span>}
+          {m.halfOneAdded>0 && <span style={{color:C.muted}}> · +{m.halfOneAdded}' 1st-half stoppage</span>}
+          {m.halfTwoAdded>0 && <span style={{color:C.muted}}> · +{m.halfTwoAdded}' 2nd-half stoppage</span>}
+        </div>
+      ))}</div>
+      <div style={{font:"600 11px Inter",color:C.muted,marginTop:6,paddingTop:6,borderTop:`1px solid ${C.line}`}}>
+        Sum: {list.map(m=>`${m.min}'`).join(" + ")||"0'"} = <b style={{color:C.gold}}>{total}'</b>
+        <div style={{marginTop:3}}>Regular time: <b style={{color:C.text}}>{sumRegular}'</b> · Stoppage time: <b style={{color:C.text}}>{sumStoppage}'</b></div>
+      </div>
+    </div>
+  );
+}
 function GloveBoard({A}){
-  const list=A.cleanSheets;
+  const list=A.keepers;
   const topVal=list.length?list[0].cs:0;
+  const [open,setOpen]=useState(null);
   return (
     <div className="card" style={{padding:14}}>
-      <BoardHead emoji="🧤" title="Golden Glove" sub="Best goalkeeper selected by the FIFA Technical Study Group." holders={[]}/>
-      <div style={{font:"500 12px Inter",color:C.muted,marginBottom:8}}>Therefore the rankings below do not decide the winner and instead are displayed for entertainment purposes only.</div>
+      <BoardHead emoji="🧤" title="Golden Glove" sub="Best goalkeeper selected by the FIFA Technical Study Group (so only use this ranking as a guide!)" holders={[]}/>
       {list.length===0 && <div style={{font:"500 12px Inter",color:C.muted}}>No clean sheets yet.</div>}
-      <div style={{display:"grid",gap:2}}>{list.map((s,i)=>{
-        const tied=s.cs===topVal;
+      {list.length>0 &&
+        <div style={{display:"flex",alignItems:"center",gap:9,padding:"0 0 4px"}}>
+          <span style={{width:18}}/><span style={{flex:1}}/>
+          <span style={{width:28,textAlign:"center",font:"700 9px Inter",letterSpacing:".5px",color:C.muted}}>CS</span>
+          <span style={{width:28,textAlign:"center",font:"700 9px Inter",letterSpacing:".5px",color:C.muted}}>S</span>
+          <span style={{width:40,textAlign:"center",font:"700 9px Inter",letterSpacing:".5px",color:C.muted}}>MIN</span>
+        </div>}
+      <div style={{display:"grid",gap:2}}>{list.map((k,i)=>{
+        const tied=k.cs===topVal;
+        const key=k.p+k.t;
+        const expanded=open===key;
+        const hasAudit=(k.matches||[]).length>0;
         return (
-        <div key={s.t} style={{display:"flex",alignItems:"center",gap:9,padding:"6px 0",borderTop:i?"1px solid rgba(255,255,255,.05)":"none"}}>
+        <div key={key}>
+        <div onClick={()=>hasAudit&&setOpen(expanded?null:key)} style={{display:"flex",alignItems:"center",gap:9,padding:"6px 0",borderTop:i?"1px solid rgba(255,255,255,.05)":"none",cursor:hasAudit?"pointer":"default"}}>
           <span className="display" style={{width:18,textAlign:"center",fontSize:15,color:tied?C.gold:C.muted}}>{i+1}</span>
-          <span style={{display:"inline-flex",alignItems:"center",gap:6}}><FlagDot team={s.t}/><span style={{font:"600 13px Inter",color:C.text}}>{s.t}</span></span>
-          <span className="owntag" style={{color:OWNER_COLOR[s.owner]}}>{s.owner}</span>
-          <span className="display" style={{marginLeft:"auto",fontSize:18,color:tied?C.gold:C.text}}>{s.cs}</span>
+          <div style={{display:"flex",alignItems:"center",gap:7,flex:1,minWidth:0}}>
+            <FlagDot team={k.t}/>
+            <div style={{minWidth:0}}>
+              <div style={{color:C.text,fontWeight:600,fontSize:13,lineHeight:1.25,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{k.p}</div>
+              <div style={{display:"flex",alignItems:"center",gap:5,lineHeight:1.2}}>
+                <span style={{font:"500 10px Inter",color:C.muted,whiteSpace:"nowrap"}}>{k.t}</span>
+                <span className="owntag" style={{color:OWNER_COLOR[OWNER_OF[k.t]]}}>{OWNER_OF[k.t]}</span>
+              </div>
+            </div>
+          </div>
+          <span className="display" style={{width:28,textAlign:"center",fontSize:16,color:tied?C.gold:C.text}}>{k.cs}</span>
+          <span style={{width:28,textAlign:"center",font:"600 13px Inter",color:C.muted}}>{k.saves||0}</span>
+          <span style={{width:40,textAlign:"center",font:"600 12px Inter",color:C.muted,textDecoration:hasAudit?"underline":"none",textDecorationStyle:"dotted"}}>{k.min!=null?`${k.min}'`:"—"}</span>
+        </div>
+        {expanded && <MinutesAudit matches={k.matches} total={k.min}/>}
         </div>);})}</div>
       <Prize value="£10"/>
     </div>

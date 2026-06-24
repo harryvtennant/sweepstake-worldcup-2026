@@ -369,6 +369,14 @@ function espnStage(ev,comp,a,b){ if(FIXTURE_INDEX[[a,b].sort().join("|")]) retur
   if(/quarter/.test(txt))return"Quarter-final"; if(/semi/.test(txt))return"Semi-final"; if(/third|3rd|play-?off/.test(txt))return"Third place"; if(/final/.test(txt))return"Final";
   const d=new Date(ev.date),md=(d.getUTCMonth()+1)*100+d.getUTCDate();
   if(md>=628&&md<=703)return"Round of 32"; if(md>=704&&md<=708)return"Round of 16"; if(md>=709&&md<=712)return"Quarter-final"; if(md>=713&&md<=716)return"Semi-final"; if(md===718)return"Third place"; if(md>=717)return"Final"; return"Round of 32"; }
+// Display-only: m.stage is just the literal "group" (used elsewhere for stage-type checks),
+// which reads as confusing/generic on the live board ("group" looks like a UI label rather
+// than info about the match). Resolve it to the actual Group letter for display, leaving
+// the underlying m.stage value untouched for everything else that depends on it.
+function stageLabel(m){
+  if(m.stage==="group"){ const hit=FIXTURE_INDEX[[m.a,m.b].sort().join("|")]; return hit?`Group ${hit.L}`:"Group stage"; }
+  return m.stage;
+}
 async function fetchESPN(){
   const settled=await Promise.allSettled(allTournamentDates().map(d=>
     fetch(`${ESPN_URL}?dates=${d}&limit=100`).then(r=>{ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })));
@@ -890,7 +898,7 @@ function LiveAndNextStrip({A}){
           {liveAll.map((m,i)=>(
             <div key={i}>
               {i>0&&<div style={{height:1,background:C.line,margin:"6px 0"}}/>}
-              <div style={{font:"600 9px Inter",color:C.muted,marginBottom:3}}>{m.stage}{m.detail?` · ${m.detail}`:m.clock?` · ${m.clock}`:""}</div>
+              <div style={{font:"600 9px Inter",color:C.muted,marginBottom:3}}>{stageLabel(m)}{m.detail?` · ${m.detail}`:m.clock?` · ${m.clock}`:""}</div>
               <ClashSide team={m.a} owner={OWNER_OF[m.a]} score={m.ga} pen={null} lose={false}/>
               <ClashSide team={m.b} owner={OWNER_OF[m.b]} score={m.gb} pen={null} lose={false}/>
             </div>
@@ -995,7 +1003,7 @@ function HeadToHead({A}){
           {liveFilt.map((m,i)=>(
             <div key={i}>
               {i>0&&<div style={{height:1,background:C.line,margin:"6px 0"}}/>}
-              <div style={{font:"600 9px Inter",color:C.muted,marginBottom:3}}>{m.stage}{m.detail?` · ${m.detail}`:m.clock?` · ${m.clock}`:""}</div>
+              <div style={{font:"600 9px Inter",color:C.muted,marginBottom:3}}>{stageLabel(m)}{m.detail?` · ${m.detail}`:m.clock?` · ${m.clock}`:""}</div>
               <ClashSide team={m.a} owner={OWNER_OF[m.a]} score={m.ga} pen={null} lose={false}/>
               <ClashSide team={m.b} owner={OWNER_OF[m.b]} score={m.gb} pen={null} lose={false}/>
             </div>

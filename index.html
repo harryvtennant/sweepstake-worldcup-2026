@@ -467,6 +467,41 @@ async function fetchPlayerStats(completedForStats){
   const settled=await Promise.allSettled(completedForStats.map(ev=>
     fetch(`${ESPN_SUMMARY_URL}?event=${ev.id}`).then(r=>{ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); }).then(json=>({ev,json}))));
   const scorerExtra={}, gkExtra={};
+
+  // Cross-reference goalkeepers across ALL matches processed this sync. Confirmed via real
+  // data: ESPN tags a substitute's `position` field as the generic "Substitute"/"SUB" role,
+  // not their actual playing position -- so a keeper who comes on as a sub (e.g. replacing
+  // an injured starter) was silently misclassified as an outfielder and his minutes dropped
+  // from the Golden Glove entirely. Fix: trust the explicit "Goalkeeper" tag wherever it
+  // appears (almost always true for the match where they started/are properly listed) and
+  // carry that identity over to every other match regardless of how that match tags them.
+  const GK_IDS=new Set();
+  settled.forEach(s=>{
+    if(s.status!=="fulfilled") return;
+    const rosters=s.value.json?.rosters||s.value.json?.boxscore?.players||[];
+    rosters.forEach(teamRoster=>{
+      const entries=teamRoster.roster||teamRoster.statistics?.[0]?.athletes||[];
+      entries.forEach(entry=>{
+        const id=entry.athlete?.id||entry.id;
+        if(id && /goalkeeper|^gk$|^g$/i.test(entry.position?.name||entry.position?.abbreviation||"")) GK_IDS.add(id);
+      });
+    });
+  });
+  // Goalkeeper substitutions are (effectively) always like-for-like -- if a sub replaced a
+  // known goalkeeper, the substitute is one too, even on their very first tournament
+  // appearance (when no match yet shows them with an explicit goalkeeper tag at all).
+  settled.forEach(s=>{
+    if(s.status!=="fulfilled") return;
+    const rosters=s.value.json?.rosters||s.value.json?.boxscore?.players||[];
+    rosters.forEach(teamRoster=>{
+      const entries=teamRoster.roster||teamRoster.statistics?.[0]?.athletes||[];
+      entries.forEach(entry=>{
+        const id=entry.athlete?.id||entry.id;
+        const replacedId=entry.subbedInFor?.athlete?.id;
+        if(id && replacedId && GK_IDS.has(replacedId)) GK_IDS.add(id);
+      });
+    });
+  });
   settled.forEach(s=>{
     if(s.status!=="fulfilled") return;
     try{
@@ -564,7 +599,7 @@ async function fetchPlayerStats(completedForStats){
         const findStat=(...keys)=>stats.find(st=>{ const n=(st.name||st.abbreviation||"").toLowerCase(); return keys.includes(n); });
         const statVal=(st)=>st?(parseInt(st.displayValue??st.value,10)||0):0;
 
-        const isGK=/goalkeeper|^gk$|^g$/i.test(entry.position?.name||entry.position?.abbreviation||"");
+        const isGK=GK_IDS.has(athleteId) || /goalkeeper|^gk$|^g$/i.test(entry.position?.name||entry.position?.abbreviation||"");
         const {min:minutes, detail:minDetail}=minutesFor(entry);
         const opponent = teamName===ev.a ? ev.b : ev.a;
         const matchLogEntry = { opponent, eventId: ev.id, ...minDetail, min: minutes };
@@ -579,7 +614,11 @@ async function fetchPlayerStats(completedForStats){
             const shotsFaced=statVal(findStat("shotsfaced","shf","shotsongoal","soga"));
             saves=Math.max(0,shotsFaced-conceded);
           }
-          const cleanSheet=minutes>0 && conceded===0 ? 1 : 0;
+          // Clean sheet requires playing the WHOLE match (kick-off to full time, including
+          // extra time in knockouts) without conceding -- a keeper subbed off, or a sub who
+          // came on, doesn't qualify even if their team didn't concede while they were on.
+          const playedFullMatch = minDetail.start===0 && minDetail.end>=(minDetail.matchLen||0) && minDetail.matchLen>0;
+          const cleanSheet=playedFullMatch && conceded===0 ? 1 : 0;
           const key=name+"|"+teamName;
           const cur=gkExtra[key]||{cs:0,saves:0,min:0,matches:[]};
           cur.cs+=cleanSheet; cur.saves+=saves; cur.min+=minutes; cur.matches.push(matchLogEntry); gkExtra[key]=cur;

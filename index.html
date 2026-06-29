@@ -361,14 +361,22 @@ function allTournamentDates(){ const out=[],start=Date.UTC(2026,5,11),end=Date.U
 function numOrNull(v){const n=parseInt(v,10);return Number.isFinite(n)?n:null;}
 function resolveTeam(team){ if(!team) return null;
   for(const f of [team.displayName,team.shortDisplayName,team.name,team.location,team.abbreviation]){ const r=normTeam(f); if(r&&OWNER_OF[r]) return r; }
-  const c=String(team.displayName||team.name||"").toLowerCase();
-  return ALL_TEAMS.find(t=>{const tl=t.toLowerCase();return c&&(c.includes(tl)||tl.includes(c));})||null; }
+  // Deliberately no fuzzy/substring fallback here. ESPN labels an unconfirmed bracket slot
+  // with placeholder text (e.g. "Winner of Match 81", or sometimes a composite description),
+  // and matching one of our 48 team names as a substring of that text can resolve it to a
+  // real team that isn't actually confirmed for this match — which is exactly how a fixture
+  // between two teams who were never really paired can appear. Better to return null and
+  // simply not show the match until ESPN gives us the real, exact team name.
+  return null; }
 function espnStage(ev,comp,a,b){ if(FIXTURE_INDEX[[a,b].sort().join("|")]) return "group";
   const txt=((comp?.notes?.[0]?.headline)||ev.name||ev.shortName||"").toLowerCase();
-  if(/round of 32|r32/.test(txt))return"Round of 32"; if(/round of 16|r16/.test(txt))return"Round of 16";
+  if(/round of 32|\br32\b/.test(txt))return"Round of 32"; if(/round of 16|\br16\b/.test(txt))return"Round of 16";
   if(/quarter/.test(txt))return"Quarter-final"; if(/semi/.test(txt))return"Semi-final"; if(/third|3rd|play-?off/.test(txt))return"Third place"; if(/final/.test(txt))return"Final";
+  // Fallback only fires when the headline/notes text isn't populated yet — dates below are the
+  // real published 2026 calendar (Round of 32: 28 Jun–3 Jul, Round of 16: 4–8 Jul, Quarters:
+  // 9–11 Jul, Semis: 14–15 Jul, Third place: 18 Jul, Final: 19 Jul), not a guess.
   const d=new Date(ev.date),md=(d.getUTCMonth()+1)*100+d.getUTCDate();
-  if(md>=628&&md<=703)return"Round of 32"; if(md>=704&&md<=708)return"Round of 16"; if(md>=709&&md<=712)return"Quarter-final"; if(md>=713&&md<=716)return"Semi-final"; if(md===718)return"Third place"; if(md>=717)return"Final"; return"Round of 32"; }
+  if(md>=628&&md<=703)return"Round of 32"; if(md>=704&&md<=708)return"Round of 16"; if(md>=709&&md<=711)return"Quarter-final"; if(md>=714&&md<=715)return"Semi-final"; if(md===718)return"Third place"; if(md===719)return"Final"; return"Round of 32"; }
 // Display-only: m.stage is just the literal "group" (used elsewhere for stage-type checks),
 // which reads as confusing/generic on the live board ("group" looks like a UI label rather
 // than info about the match). Resolve it to the actual Group letter for display, leaving
@@ -698,11 +706,16 @@ function mergeLive(prev,p){
       const cur=gr[hit.fx.id]; if(cur&&cur.src==="manual") return;
       const fwd=hit.fx.a===m.a; gr[hit.fx.id]={hs:fwd?m.ga:m.gb,as:fwd?m.gb:m.ga,src:"auto"};
     } else {
+      // Matched by team-pair alone, not round — two teams can only meet once in the knockout
+      // stage, so if ESPN's round classification for this match shifts between syncs (e.g. the
+      // date-based fallback guessed one round before headline text became available and gave
+      // a different one), this corrects the existing record in place rather than leaving a
+      // stale duplicate sitting under the old, wrong round forever.
       const round=m.stage; const key=[m.a,m.b].sort().join("|");
-      const i=ko.findIndex(x=>x.round===round && [x.a,x.b].sort().join("|")===key);
+      const i=ko.findIndex(x=>[x.a,x.b].sort().join("|")===key);
       if(i>=0 && ko[i].src==="manual") return;
       const A=i<0?m.a:ko[i].a; const fwd=A===m.a;
-      const rec={id:i<0?`ko-${round}-${key}`:ko[i].id,round,a:A,b:i<0?m.b:ko[i].b,
+      const rec={id:i<0?`ko-${key}`:ko[i].id,round,a:A,b:i<0?m.b:ko[i].b,
         hs:fwd?m.ga:m.gb,as:fwd?m.gb:m.ga,pa:m.pa==null?null:(fwd?m.pa:m.pb),pb:m.pb==null?null:(fwd?m.pb:m.pa),src:"auto"};
       if(i<0) ko.push(rec); else ko[i]=rec;
     }
@@ -1121,33 +1134,402 @@ function GroupsView({A}){
   );
 }
 
+const R32_SEED = [
+  ["Germany","Paraguay"],["France","Sweden"],["South Africa","Canada"],["Netherlands","Morocco"],
+  ["Portugal","Croatia"],["Spain","Austria"],["United States","Bosnia"],["Belgium","Senegal"],
+  ["Brazil","Japan"],["Ivory Coast","Norway"],["Mexico","Ecuador"],["England","DR Congo"],
+  ["Argentina","Cape Verde"],["Australia","Egypt"],["Switzerland","Algeria"],["Colombia","Ghana"],
+];
+const MAIN_ROUNDS = ["Round of 32","Round of 16","Quarter-final","Semi-final","Final"];
+const pairKey=(a,b)=>[a,b].sort().join("|");
+const slotKey=s=>s.round+"|"+s.slot; // stable React key / position lookup — works even for TBC slots
+
+// Gathers one entry per real-world knockout matchup we actually have data for — completed
+// (from state.ko), live (from A.live), or merely scheduled (from state.upcoming) — deduped by
+// team-pair alone, since a single pair can only meet once in the knockout stage.
+function mergeKoCandidates(state,A){
+  const out=new Map();
+  (state.ko||[]).forEach(m=>{ if(m.hs==null||m.as==null) return;
+    out.set(pairKey(m.a,m.b),{round:m.round,a:m.a,b:m.b,hs:m.hs,as:m.as,pa:m.pa,pb:m.pb,date:null,status:"completed"}); });
+  (A.live||[]).filter(m=>m.stage!=="group").forEach(m=>{
+    out.set(pairKey(m.a,m.b),{round:m.stage,a:m.a,b:m.b,hs:null,as:null,pa:null,pb:null,date:null,status:"live",live:m}); });
+  (state.upcoming||[]).filter(u=>u.stage!=="group"&&OWNER_OF[u.a]&&OWNER_OF[u.b]).forEach(u=>{
+    const key=pairKey(u.a,u.b); if(!out.has(key)) out.set(key,{round:u.stage,a:u.a,b:u.b,hs:null,as:null,pa:null,pb:null,date:u.ko,status:"upcoming"}); });
+  return [...out.values()];
+}
+
+// Walks the fixed bracket skeleton and returns EVERY slot across every round — 16 + 8 + 4 + 2 +
+// 1 Final + 1 Third place, always, regardless of how far the tournament has actually progressed.
+// A slot's teams come from (in order of preference): a real fixture we have for that exact
+// pairing (matched by team identity, never by trusting ESPN's own round label — headline/date
+// heuristics can drift between syncs); otherwise the winner of each parent slot, propagated
+// forward once that match is completed; otherwise left as null, which the UI shows as "TBC".
+// Home/away order follows the real fixture's own (ESPN's homeAway field) whenever one exists —
+// that's the actual official designation — and only falls back to the official Round of 32 draw
+// order, or the convention that a slot's first team descends from the earlier-listed parent slot,
+// when there's no real fixture yet to ask.
+function buildBracketSkeleton(fixtures){
+  const byPair=new Map(fixtures.map(fx=>[pairKey(fx.a,fx.b),fx]));
+  const winnerOf=fx=>{ if(!fx||fx.status!=="completed") return null; const wl=koWL(fx); return wl?wl.w:null; };
+  const loserOf=fx=>{ if(!fx||fx.status!=="completed") return null; const wl=koWL(fx); return wl?wl.l:null; };
+  const makeSlot=(round,slot,a,b)=>{
+    const fixture=(a&&b)?(byPair.get(pairKey(a,b))||null):null;
+    if(fixture){ fixture.round=round; fixture.slot=slot; }
+    return {round,slot,a:fixture?fixture.a:a,b:fixture?fixture.b:b,fixture};
+  };
+  let prev=R32_SEED.map(([a,b],i)=>makeSlot("Round of 32",i,a,b));
+  const all=[...prev];
+  let sfSlots=null;
+  ["Round of 16","Quarter-final","Semi-final","Final"].forEach(round=>{
+    const cur=[];
+    for(let i=0;i<prev.length;i+=2){
+      const A=winnerOf(prev[i].fixture), B=winnerOf(prev[i+1].fixture);
+      const s=makeSlot(round,i/2,A,B); cur.push(s); all.push(s);
+    }
+    if(round==="Semi-final") sfSlots=cur;
+    prev=cur;
+  });
+  if(sfSlots&&sfSlots.length===2){
+    all.push(makeSlot("Third place",0,loserOf(sfSlots[0].fixture),loserOf(sfSlots[1].fixture)));
+  }
+  return all;
+}
+// Normalises a skeleton slot into the same shape KoCard/BracketMatchCard already render —
+// "pending" covers a slot with no real ESPN fixture yet (whether or not both teams are known).
+function slotToFixture(slot){
+  if(slot.fixture) return slot.fixture;
+  return {round:slot.round,slot:slot.slot,a:slot.a,b:slot.b,hs:null,as:null,pa:null,pb:null,date:null,status:"pending"};
+}
+
+// Pixel positions for every slot, plus the parent->child connector lines. Parentage is purely
+// positional now (slot i's parents are always parent-round slots 2i and 2i+1) rather than
+// matched by shared team, so the tree connects correctly even while slots are still TBC.
+// Third place is deliberately excluded from this chain — it's rendered separately, beneath the
+// Final column, with no connecting line (see KoBracket).
+function bracketGeometry(slotsByRound,roundsOrder,colW,colGap,rowH,rowGap,topPad){
+  const cols=roundsOrder.map((r,i)=>({round:r,x:i*(colW+colGap)}));
+  const colX={}; cols.forEach(c=>colX[c.round]=c.x);
+
+  // Vertical center of every slot, computed down the FULL chain (Round of 32 -> ... -> Final)
+  // regardless of which rounds are currently displayed, so a later round's spacing is always
+  // correct even when round-filtered. Round of 32 is evenly spaced; every round after that sits
+  // each fixture exactly halfway between the vertical centers of the two fixtures that feed it
+  // — the standard bracket look — falling back to whichever single parent is known, or to even
+  // spacing, if a parent slot doesn't exist yet.
+  const centerY={};
+  (slotsByRound["Round of 32"]||[]).forEach((s,i)=>{ centerY[slotKey(s)]=topPad+i*(rowH+rowGap)+rowH/2; });
+  const PREV_OF={"Round of 16":"Round of 32","Quarter-final":"Round of 16","Semi-final":"Quarter-final","Final":"Semi-final"};
+  ["Round of 16","Quarter-final","Semi-final","Final"].forEach(round=>{
+    const prevList=slotsByRound[PREV_OF[round]]||[];
+    (slotsByRound[round]||[]).forEach(s=>{
+      const p1=prevList[s.slot*2], p2=prevList[s.slot*2+1];
+      const y1=p1?centerY[slotKey(p1)]:null, y2=p2?centerY[slotKey(p2)]:null;
+      if(y1!=null&&y2!=null) centerY[slotKey(s)]=(y1+y2)/2;
+      else if(y1!=null) centerY[slotKey(s)]=y1;
+      else if(y2!=null) centerY[slotKey(s)]=y2;
+      else centerY[slotKey(s)]=topPad+s.slot*(rowH+rowGap)+rowH/2;
+    });
+  });
+
+  const pos={};
+  roundsOrder.forEach(round=>(slotsByRound[round]||[]).forEach(s=>{
+    pos[slotKey(s)]={x:colX[round],y:centerY[slotKey(s)]-rowH/2}; }));
+  const maxRows=Math.max(1,...roundsOrder.map(r=>(slotsByRound[r]||[]).length));
+  const allY=Object.values(pos).map(p=>p.y);
+  const width=roundsOrder.length*colW+Math.max(0,roundsOrder.length-1)*colGap;
+  const height=(allY.length?Math.max(...allY)+rowH:topPad+maxRows*rowH)+topPad;
+  const links=[];
+  const CHAIN=[["Round of 32","Round of 16"],["Round of 16","Quarter-final"],["Quarter-final","Semi-final"],["Semi-final","Final"]];
+  CHAIN.forEach(([p,c])=>{
+    if(!roundsOrder.includes(p)||!roundsOrder.includes(c)) return;
+    (slotsByRound[c]||[]).forEach(cs=>{
+      [slotsByRound[p]?.[cs.slot*2],slotsByRound[p]?.[cs.slot*2+1]].filter(Boolean).forEach(ps=>{
+        links.push({from:slotKey(ps),to:slotKey(cs)});
+      });
+    });
+  });
+  return {pos,width,height,links,cols};
+}
+
 function KnockoutsView({state,A}){
-  const ko=state.ko||[]; const rounds=KO_ORDER.map(r=>[r,ko.filter(m=>m.round===r)]).filter(([,m])=>m.length);
-  const liveFor=m=>(A.live||[]).find(l=>l.stage===m.round && ((l.a===m.a&&l.b===m.b)||(l.a===m.b&&l.b===m.a)));
+  const [filterOwner,setFilterOwner]=useState("");
+  const [filterTeam,setFilterTeam]=useState("");
+  const [filterRound,setFilterRound]=useState("");
+  const [showBracket,setShowBracket]=useState(false);
+  const bracketApiRef=useRef(null);
+
+  const koCandidates=useMemo(()=>mergeKoCandidates(state,A),[state,A]);
+  const bracketSlots=useMemo(()=>buildBracketSkeleton(koCandidates),[koCandidates]);
+  // The list/live/next boards only ever show fixtures the skeleton actually placed somewhere —
+  // a pairing that can't occur in the real draw (e.g. two teams whose paths don't cross until
+  // the Final) isn't a real fixture, regardless of what round any upstream heuristic guessed.
+  const fixtures=useMemo(()=>{
+    const valid=new Set(bracketSlots.filter(s=>s.fixture).map(s=>pairKey(s.fixture.a,s.fixture.b)));
+    return koCandidates.filter(fx=>valid.has(pairKey(fx.a,fx.b)));
+  },[koCandidates,bracketSlots]);
+  const matchesFilter=fx=>{
+    if(filterOwner && OWNER_OF[fx.a]!==filterOwner && OWNER_OF[fx.b]!==filterOwner) return false;
+    if(filterTeam && fx.a!==filterTeam && fx.b!==filterTeam) return false;
+    if(filterRound && fx.round!==filterRound) return false;
+    return true;
+  };
+  const visible=fixtures.filter(matchesFilter);
+  const rounds=KO_ORDER.map(r=>[r,visible.filter(fx=>fx.round===r)]).filter(([,m])=>m.length);
+  const filterLabel=filterOwner?` · ${filterOwner}`:filterTeam?` · ${filterTeam}`:filterRound?` · ${filterRound}`:"";
+
+  // Bracket view always shows every slot in every round — including ones still TBC — so Third
+  // place is split out here (it's rendered separately, see KoBracket) and the round filter
+  // genuinely narrows the bracket down to just that round (or just the Third place card),
+  // unlike the player/team filters, which dim non-matching cards instead so a team's whole
+  // path across rounds stays visible (see highlightFn below).
+  const slotsByRound=useMemo(()=>{ const m={}; MAIN_ROUNDS.forEach(r=>m[r]=bracketSlots.filter(s=>s.round===r)); return m; },[bracketSlots]);
+  const thirdPlaceSlot=useMemo(()=>bracketSlots.find(s=>s.round==="Third place")||null,[bracketSlots]);
+  const bracketRoundsOrder=useMemo(()=>{
+    if(!filterRound) return MAIN_ROUNDS;
+    return filterRound==="Third place" ? [] : MAIN_ROUNDS.filter(r=>r===filterRound);
+  },[filterRound]);
+  const showThirdPlaceCard=!!thirdPlaceSlot && (!filterRound||filterRound==="Third place");
+  const highlightFn=fx=>!(filterOwner||filterTeam)||matchesFilter(fx);
+
+  const handleReset=()=>{ setFilterOwner(""); setFilterTeam(""); setFilterRound(""); bracketApiRef.current?.reset?.(); };
+
+  // Live/next board — same shape & ordering as the H2H tab, scoped to knockout-stage matches.
+  const liveFilt=visible.filter(fx=>fx.status==="live").map(fx=>fx.live);
+  const nowMs=Date.now();
+  const upFiltAll=visible.filter(fx=>fx.status==="upcoming"&&fx.date&&new Date(fx.date).getTime()>nowMs)
+    .sort((a,b)=>new Date(a.date)-new Date(b.date));
+  let nextFx=[];
+  if(upFiltAll.length){ const e=new Date(upFiltAll[0].date).getTime(); nextFx=upFiltAll.filter(u=>new Date(u.date).getTime()-e<60000); }
+
   return (
     <div style={{paddingTop:14}}>
-      {ko.length===0 && <div className="card" style={{padding:20,textAlign:"center",color:C.muted,font:"500 13px Inter"}}>Knockouts haven't started. Round of 32 begins 28 June; results sync in automatically.</div>}
-      {rounds.map(([round,matches])=>(
-        <div key={round} style={{marginBottom:18}}>
-          <div className="display" style={{fontSize:16,color:C.gold,margin:"4px 2px 8px"}}>{round}</div>
-          <div style={{display:"grid",gap:8}}>{matches.map(m=><KoCard key={m.id} m={m} live={liveFor(m)}/>)}</div>
-        </div>))}
+      <p style={{font:"500 12px/1.5 Inter",color:C.muted,margin:"0 2px 12px"}}>Every knockout fixture for a pooled team that's through — played, live, or scheduled — so you can follow each team's path to the Final.</p>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+        <div>
+          <label className="lbl">Filter by player</label>
+          <select className="inp" value={filterOwner} onChange={e=>{setFilterOwner(e.target.value);setFilterTeam("");}}>
+            <option value="">All players</option>
+            {[...OWNERS].sort().map(o=><option key={o} value={o}>{o}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="lbl">Filter by team</label>
+          <select className="inp" value={filterTeam} onChange={e=>{setFilterTeam(e.target.value);setFilterOwner("");}}>
+            <option value="">All teams</option>
+            {GROUP_LETTERS.map(L=><optgroup key={L} label={`Group ${L}`}>{GROUPS[L].map(t=><option key={t} value={t}>{t}</option>)}</optgroup>)}
+          </select>
+        </div>
+        <div>
+          <label className="lbl">Filter by round</label>
+          <select className="inp" value={filterRound} onChange={e=>setFilterRound(e.target.value)}>
+            <option value="">All rounds</option>
+            {KO_ORDER.map(r=><option key={r} value={r}>{r}</option>)}
+          </select>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"flex-end"}}>
+          <button type="button" className={"tab"+(showBracket?" active":"")} style={{margin:0}} onClick={()=>setShowBracket(v=>!v)}>{showBracket?"List view":"Bracket view"}</button>
+          <button type="button" className="xbtn" style={{flex:"0 0 auto"}} onClick={handleReset}>Reset</button>
+        </div>
+      </div>
+
+      {liveFilt.length>0 && (
+        <div className="card" style={{padding:"10px 12px",marginBottom:12,borderColor:"rgba(63,215,139,.35)"}}>
+          <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}>
+            <span style={{width:7,height:7,borderRadius:"50%",background:C.green,boxShadow:`0 0 6px ${C.green}`}}/>
+            <span style={{font:"700 9px Inter",letterSpacing:"1px",color:C.green,textTransform:"uppercase"}}>Live now{filterLabel}</span>
+          </div>
+          {liveFilt.map((m,i)=>(
+            <div key={i}>
+              {i>0&&<div style={{height:1,background:C.line,margin:"6px 0"}}/>}
+              <div style={{font:"600 9px Inter",color:C.muted,marginBottom:3}}>{stageLabel(m)}{m.detail?` · ${m.detail}`:m.clock?` · ${m.clock}`:""}</div>
+              <ClashSide team={m.a} owner={OWNER_OF[m.a]} score={m.ga} pen={null} lose={false}/>
+              <ClashSide team={m.b} owner={OWNER_OF[m.b]} score={m.gb} pen={null} lose={false}/>
+            </div>
+          ))}
+        </div>
+      )}
+      {nextFx.length>0 && (
+        <div className="card" style={{padding:"10px 12px",marginBottom:12,borderColor:"rgba(244,201,93,.3)"}}>
+          <div style={{font:"700 9px Inter",letterSpacing:"1px",color:C.gold,textTransform:"uppercase",marginBottom:6}}>
+            {`Next match${nextFx.length>1?"es":""}${filterLabel}`}
+            {nextFx[0].date&&<span style={{fontWeight:500,color:C.muted,marginLeft:8,textTransform:"none"}}>{fmtMatchDate(nextFx[0].date)}</span>}
+          </div>
+          {nextFx.map((u,i)=>(
+            <div key={i}>
+              {i>0&&<div style={{height:1,background:C.line,margin:"4px 0"}}/>}
+              <div style={{display:"flex",alignItems:"center",gap:6,padding:"4px 0"}}>
+                <span style={{font:"600 12px Inter",color:C.text,flex:1,textAlign:"right"}}>{u.a}</span>
+                <span className="owntag" style={{color:OWNER_COLOR[OWNER_OF[u.a]]}}>{OWNER_OF[u.a]}</span>
+                <span style={{font:"800 11px Inter",color:C.muted,padding:"0 6px"}}>vs</span>
+                <span className="owntag" style={{color:OWNER_COLOR[OWNER_OF[u.b]]}}>{OWNER_OF[u.b]}</span>
+                <span style={{font:"600 12px Inter",color:C.text,flex:1}}>{u.b}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {showBracket
+        ? <KoBracket slotsByRound={slotsByRound} roundsOrder={bracketRoundsOrder} thirdPlaceSlot={showThirdPlaceCard?thirdPlaceSlot:null} highlightFn={highlightFn} apiRef={bracketApiRef}/>
+        : (
+        <>
+          {fixtures.length===0 && <div className="card" style={{padding:20,textAlign:"center",color:C.muted,font:"500 13px Inter"}}>Knockouts haven't started. Round of 32 begins 28 June; fixtures and results sync in automatically.</div>}
+          {fixtures.length>0 && visible.length===0 && <div className="card" style={{padding:18,textAlign:"center",color:C.muted,font:"500 13px Inter"}}>No knockout fixtures match this filter.</div>}
+          {rounds.map(([round,matches])=>(
+            <div key={round} style={{marginBottom:18}}>
+              <div className="display" style={{fontSize:16,color:C.gold,margin:"4px 2px 8px"}}>{round}</div>
+              <div style={{display:"grid",gap:8}}>{matches.map(fx=><KoCard key={pairKey(fx.a,fx.b)} fx={fx}/>)}</div>
+            </div>))}
+        </>
+      )}
     </div>
   );
 }
-function KoCard({m,live}){ const wl=koWL(m);
-  // While the match is live, show the in-progress score instead of m.hs/m.as (which stay
-  // null until full-time anyway) — oriented to whichever side of `live` matches team a/b.
-  const liveFwd=live&&live.a===m.a;
-  const lhs=live?(liveFwd?live.ga:live.gb):null, las=live?(liveFwd?live.gb:live.ga):null;
-  const hs=live?lhs:m.hs, as=live?las:m.as;
+function KoCard({fx}){
+  const live=fx.status==="live"?fx.live:null;
+  const wl=fx.status==="completed"?koWL(fx):null;
+  const hs=live?live.ga:fx.hs, as=live?live.gb:fx.as;
+  const dateLbl=fx.status==="upcoming"?fmtMatchDate(fx.date):null;
   const row=(team,score,pen)=>(<div style={{display:"flex",alignItems:"center",gap:8,padding:"7px 0",opacity:wl&&wl.l===team?.5:1}}>
     <FlagDot team={team}/><span style={{color:C.text,font:"600 14px Inter"}}>{team}</span><span className="owntag" style={{color:OWNER_COLOR[OWNER_OF[team]]}}>{OWNER_OF[team]}</span>
     {wl&&wl.w===team&&<span style={{marginLeft:"auto",font:"700 11px Inter",color:C.green}}>WON</span>}
     <span className="display" style={{marginLeft:wl&&wl.w===team?8:"auto",fontSize:20,color:C.text}}>{score==null?"–":score}{pen!=null?<sup style={{fontSize:11,color:C.gold}}> ({pen})</sup>:null}</span></div>);
   return <div className="card" style={{padding:"4px 14px"}}>
-    {live && <div style={{display:"flex",alignItems:"center",gap:5,padding:"6px 0 0",font:"800 9px Inter",letterSpacing:"1px",textTransform:"uppercase",color:C.red}}><i className="live-dot"/>Live</div>}
-    {row(m.a,hs,m.pa)}<div style={{height:1,background:C.line}}/>{row(m.b,as,m.pb)}</div>;
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:6,padding:"6px 0 0"}}>
+      <span style={{font:"700 9px Inter",letterSpacing:"1px",color:C.muted,textTransform:"uppercase"}}>{fx.round}</span>
+      {live && <span style={{display:"flex",alignItems:"center",gap:5,font:"800 9px Inter",letterSpacing:"1px",textTransform:"uppercase",color:C.red,whiteSpace:"nowrap"}}><i className="live-dot"/>Live{live.detail?` · ${live.detail}`:live.clock?` · ${live.clock}`:""}</span>}
+      {dateLbl && <span style={{font:"500 10px Inter",color:C.muted,whiteSpace:"nowrap"}}>{dateLbl}</span>}
+    </div>
+    {row(fx.a,hs,fx.pa)}<div style={{height:1,background:C.line}}/>{row(fx.b,as,fx.pb)}</div>;
+}
+
+// Pannable/zoomable bracket board. Pointer Events cover mouse + touch + pen in one code path:
+// one active pointer pans, two active pointers (a pinch) zoom around their midpoint. The board
+// itself owns the gesture (touchAction:"none" + pointer capture) so none of it leaks out to
+// scroll or zoom the page underneath.
+const BRK_COL_W=178, BRK_COL_GAP=46, BRK_ROW_H=72, BRK_ROW_GAP=14, BRK_TOP_PAD=30;
+function KoBracket({slotsByRound,roundsOrder,thirdPlaceSlot,highlightFn,apiRef}){
+  const geo=useMemo(()=>bracketGeometry(slotsByRound,roundsOrder,BRK_COL_W,BRK_COL_GAP,BRK_ROW_H,BRK_ROW_GAP,BRK_TOP_PAD),[slotsByRound,roundsOrder]);
+  // Third place sits beneath the Final column (or top-left if Final isn't currently shown,
+  // e.g. when round-filtered to just Third place) — deliberately not wired into geo.links,
+  // since a connector down to it from the Semi-finals reads messily; it's just listed here.
+  const finalCol=geo.cols.find(c=>c.round==="Final");
+  const finalSlots=roundsOrder.includes("Final")?(slotsByRound["Final"]||[]):[];
+  const finalY=finalSlots.length?geo.pos[slotKey(finalSlots[0])].y:BRK_TOP_PAD;
+  const thirdPos=thirdPlaceSlot?{x:finalCol?finalCol.x:0,y:finalY+BRK_ROW_H+BRK_ROW_GAP*3}:null;
+
+  const boardRef=useRef(null), contentRef=useRef(null);
+  const pointers=useRef(new Map()); const pinch=useRef(null);
+  const t=useRef({x:18,y:18,scale:1});
+  const clampScale=s=>Math.max(0.4,Math.min(2.2,s));
+  const apply=()=>{ if(contentRef.current){ const {x,y,scale}=t.current; contentRef.current.style.transform=`translate(${x}px,${y}px) scale(${scale})`; } };
+  const reset=()=>{ t.current={x:18,y:18,scale:1}; apply(); };
+  useEffect(()=>{ reset(); },[geo]);
+  useEffect(()=>{ if(apiRef) apiRef.current={reset}; },[apiRef,geo]);
+
+  const onDown=e=>{
+    try{boardRef.current.setPointerCapture(e.pointerId);}catch(_){}
+    pointers.current.set(e.pointerId,{x:e.clientX,y:e.clientY});
+    if(pointers.current.size===2){
+      const pts=[...pointers.current.values()];
+      pinch.current={dist:Math.hypot(pts[0].x-pts[1].x,pts[0].y-pts[1].y),
+        scale0:t.current.scale,x0:t.current.x,y0:t.current.y,
+        midX:(pts[0].x+pts[1].x)/2,midY:(pts[0].y+pts[1].y)/2};
+    }
+  };
+  const onMove=e=>{
+    if(!pointers.current.has(e.pointerId)) return;
+    const prev=pointers.current.get(e.pointerId), cur={x:e.clientX,y:e.clientY};
+    pointers.current.set(e.pointerId,cur);
+    if(pointers.current.size===1){
+      t.current.x+=cur.x-prev.x; t.current.y+=cur.y-prev.y; apply();
+    } else if(pointers.current.size===2 && pinch.current){
+      const pts=[...pointers.current.values()];
+      const dist=Math.hypot(pts[0].x-pts[1].x,pts[0].y-pts[1].y);
+      const newScale=clampScale(pinch.current.scale0*(dist/(pinch.current.dist||1)));
+      const rect=boardRef.current.getBoundingClientRect();
+      const mx=pinch.current.midX-rect.left, my=pinch.current.midY-rect.top;
+      const r=newScale/pinch.current.scale0;
+      t.current.x=mx-(mx-pinch.current.x0)*r; t.current.y=my-(my-pinch.current.y0)*r;
+      t.current.scale=newScale; apply();
+    }
+  };
+  const onUp=e=>{ pointers.current.delete(e.pointerId); if(pointers.current.size<2) pinch.current=null; };
+  const onWheel=e=>{
+    e.preventDefault();
+    const rect=boardRef.current.getBoundingClientRect();
+    const cx=e.clientX-rect.left, cy=e.clientY-rect.top;
+    const factor=e.deltaY<0?1.12:0.89;
+    const newScale=clampScale(t.current.scale*factor);
+    const r=newScale/t.current.scale;
+    t.current.x=cx-(cx-t.current.x)*r; t.current.y=cy-(cy-t.current.y)*r; t.current.scale=newScale; apply();
+  };
+
+  return (
+    <div style={{position:"relative"}}>
+      <div ref={boardRef} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp} onPointerLeave={onUp} onWheel={onWheel}
+        style={{position:"relative",height:420,overflow:"hidden",touchAction:"none",borderRadius:14,border:`1px solid ${C.line}`,background:"#0B1120",cursor:"grab"}}>
+        <div ref={contentRef} style={{position:"absolute",top:0,left:0,transformOrigin:"0 0",willChange:"transform"}}>
+          <svg width={geo.width+10} height={geo.height+10} style={{position:"absolute",top:0,left:0,overflow:"visible",pointerEvents:"none"}}>
+            {geo.links.map((l,i)=>{
+              const a=geo.pos[l.from], b=geo.pos[l.to]; if(!a||!b) return null;
+              const x1=a.x+BRK_COL_W, y1=a.y+BRK_ROW_H/2, x2=b.x, y2=b.y+BRK_ROW_H/2, mx=(x1+x2)/2;
+              return <path key={i} d={`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`} fill="none" stroke="rgba(255,255,255,.16)" strokeWidth={2}/>;
+            })}
+          </svg>
+          {geo.cols.map(c=>(
+            <div key={c.round} style={{position:"absolute",top:4,left:c.x,width:BRK_COL_W,textAlign:"center"}}>
+              <span style={{font:"700 10px Inter",letterSpacing:".5px",textTransform:"uppercase",color:C.gold,whiteSpace:"nowrap"}}>{c.round}</span>
+            </div>
+          ))}
+          {roundsOrder.flatMap(round=>(slotsByRound[round]||[]).map(slot=>{
+            const p=geo.pos[slotKey(slot)]; if(!p) return null;
+            const fx=slotToFixture(slot);
+            return (
+              <div key={slotKey(slot)} style={{position:"absolute",left:p.x,top:p.y,width:BRK_COL_W}}>
+                <BracketMatchCard fx={fx} dim={!highlightFn(fx)}/>
+              </div>
+            );
+          }))}
+          {thirdPlaceSlot && thirdPos && (
+            <div style={{position:"absolute",left:thirdPos.x,top:thirdPos.y,width:BRK_COL_W}}>
+              <div style={{textAlign:"center",marginBottom:4}}>
+                <span style={{font:"700 10px Inter",letterSpacing:".5px",textTransform:"uppercase",color:C.gold,whiteSpace:"nowrap"}}>Match for third place</span>
+              </div>
+              <BracketMatchCard fx={slotToFixture(thirdPlaceSlot)} dim={!highlightFn(slotToFixture(thirdPlaceSlot))}/>
+            </div>
+          )}
+        </div>
+      </div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:6}}>
+        <span style={{font:"500 10px Inter",color:C.muted}}>Drag to pan · pinch or scroll to zoom</span>
+      </div>
+    </div>
+  );
+}
+function BracketMatchCard({fx,dim}){
+  const live=fx.status==="live"?fx.live:null;
+  const wl=fx.status==="completed"?koWL(fx):null;
+  const hs=live?live.ga:fx.hs, as=live?live.gb:fx.as;
+  const row=(team,score,pen)=>{
+    const tbc=!team;
+    return (
+      <div style={{display:"flex",alignItems:"center",gap:5,padding:"3px 0",opacity:(!tbc&&wl&&wl.l===team)?.5:1}}>
+        <FlagDot team={team}/>
+        <span style={{font:tbc?"600 11px Inter":"600 11px Inter",fontStyle:tbc?"italic":"normal",color:tbc?C.muted:C.text,flex:1,minWidth:0,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{tbc?"TBC":team}</span>
+        <span className="display" style={{fontSize:13,color:tbc?C.muted:C.text}}>{score==null?"–":score}{pen!=null?<sup style={{fontSize:8,color:C.gold}}>({pen})</sup>:null}</span>
+      </div>
+    );
+  };
+  return (
+    <div className="card" style={{padding:"6px 8px",opacity:dim?0.3:1,filter:dim?"grayscale(.7)":"none",borderColor:live?"rgba(251,107,91,.45)":C.line,transition:"opacity .15s, filter .15s"}}>
+      {live && <div style={{display:"flex",alignItems:"center",gap:4,font:"800 8px Inter",letterSpacing:".5px",textTransform:"uppercase",color:C.red,marginBottom:2}}><i className="live-dot"/>Live</div>}
+      {row(fx.a,hs,fx.pa)}
+      <div style={{height:1,background:C.line}}/>
+      {row(fx.b,as,fx.pb)}
+    </div>
+  );
 }
 
 function AwardsView({A}){

@@ -783,6 +783,18 @@ function analyse(state){
     if(earlyOutByGroup[L].has(t)){teamOut[t]=true;return;}
     if(complete[L]){const r=rankOf[t]; if(r===4){teamOut[t]=true;return;} if(r===3){teamOut[t]=allComplete?!thirdAdv.has(t):false;return;}} teamOut[t]=false; });
 
+  // Group-stage-only snapshot, deliberately excluding koLosers — once a team's group-stage
+  // fate is decided (group complete, and for 3rd-placed teams, once all groups are complete
+  // so the best-8-thirds comparison is final) this value is locked in for the rest of the
+  // tournament. Used by the Groups tab so it keeps showing who progressed FROM THE GROUPS,
+  // rather than flipping a team back to "out" the moment they're later eliminated in the
+  // knockouts — that's what `teamOut` above is for, and it stays untouched for every other
+  // use (owner odds, teamsLeft, sidebar chips, etc).
+  const groupOut={};
+  ALL_TEAMS.forEach(t=>{ const L=GROUP_OF[t];
+    if(earlyOutByGroup[L].has(t)){groupOut[t]=true;return;}
+    if(complete[L]){const r=rankOf[t]; if(r===4){groupOut[t]=true;return;} if(r===3){groupOut[t]=allComplete?!thirdAdv.has(t):false;return;}} groupOut[t]=false; });
+
   const groupStats={}; GROUP_LETTERS.forEach(L=>standings[L].forEach(s=>groupStats[s.name]=s));
   const owner={}; OWNERS.forEach(o=>owner[o]={owner:o,p:0,w:0,d:0,l:0,gf:0,ga:0,teams:[],teamsLeft:0});
   ALL_TEAMS.forEach(t=>{const o=OWNER_OF[t],g=groupStats[t],k=koStats[t],O=owner[o];
@@ -833,7 +845,7 @@ function analyse(state){
 
   const bootWinners = tiedWinners(scorers, s=>`${s.g}|${s.a||0}|${s.min??"x"}`, s=>OWNER_OF[s.t]);
 
-  return { standings,complete,allComplete,teamOut,owner,ownerRanked,champion,h2hRanked,loser,h2hPlayed,
+  return { standings,complete,allComplete,teamOut,groupOut,owner,ownerRanked,champion,h2hRanked,loser,h2hPlayed,
     usingOfficial: !!official, upcoming, live, liveStandings, liveTeamInfo,
     clashes:clashes.slice().reverse(), scorers, keepers, bootLeader:scorers[0]||null, gloveLeader:keepers[0]||null,
     bootWinners };
@@ -1102,7 +1114,7 @@ function GroupsView({A}){
                 <th style={{textAlign:"left",padding:"4px 4px",fontWeight:700,fontSize:9,letterSpacing:".3px",textTransform:"uppercase",borderBottom:`1px solid ${C.line}`,color:C.muted}}>Team</th>
                 {["P","W","D","L","GF","GA","GD","Pts"].map(h=><th key={h} style={{textAlign:"center",padding:"4px 0",fontWeight:700,fontSize:9,letterSpacing:"0",textTransform:"uppercase",borderBottom:`1px solid ${C.line}`,color:C.muted}}>{h}</th>)}
               </tr></thead>
-              <tbody>{st.map((s,ri)=>{const out=A.teamOut[s.name]; const last=ri===st.length-1;
+              <tbody>{st.map((s,ri)=>{const out=A.groupOut[s.name]; const last=ri===st.length-1;
                 const liveM=A.liveTeamInfo[s.name]; const isLiveHere=liveM&&liveM.stage==="group";
                 return (<tr key={s.name} style={{opacity:out?.45:1}}>
                   <td style={{padding:"7px 0",borderBottom:last?"none":`1px solid rgba(255,255,255,.05)`,textAlign:"center"}}>
